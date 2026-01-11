@@ -2,9 +2,15 @@
 
 If you just wanna run the experiments, run `./run_experiments.sh`.
 
-There is two scripts here: mnist_backprop.py and mnist_eggroll.py.   
+### Requirements:
+- **uv**: You need to have `uv` installed. Installation instructions: [https://docs.astral.sh/uv/getting-started/installation/](https://docs.astral.sh/uv/getting-started/installation/)
+- **GPU**: A GPU with 16GB VRAM is recommended for `mnist_eggroll.py`. If you have less VRAM, you must reduce the population size in `mnist_eggroll.py` (which will reduce performance).  
 
-The first uses standard backpropagation to converge on the MNIST dataset. The latter uses backprop-free Evolution Strategies (ES) to converge on the MNIST dataset.   
+### Overview:
+
+There is two scripts that are run by `run_experiments.sh`: `mnist_backprop.py` and `mnist_eggroll.py`.   
+
+The first uses standard backpropagation and the latter uses backprop-free Evolution Strategies (ES) to converge on the MNIST dataset.   
 
 Both scripts use the same network architecture (3-layer MLP with 256 hidden units), same activation function (GELU), same batch size (128), same number of epochs (10). The remaining hyperparameters of both were optimized in extensive grid searches.
 
