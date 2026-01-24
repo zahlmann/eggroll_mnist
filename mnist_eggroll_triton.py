@@ -46,13 +46,13 @@ def philox_4x32_10(c0, c1, c2, c3, key):
     PHILOX_KEY_A: tl.constexpr = 0x9E3779B9
     PHILOX_KEY_B: tl.constexpr = 0xBB67AE85
 
-    k0 = key & 0xFFFFFFFF
-    k1 = (key >> 32) ^ 0x1BD11BDA
+    k0 = key.to(tl.uint32)
+    k1 = ((key >> 32) ^ 0x1BD11BDA).to(tl.uint32)
 
     for _ in range(10):
         c0, c1, c2, c3 = philox_round(c0, c1, c2, c3, k0, k1)
-        k0 = (k0 + PHILOX_KEY_A) & 0xFFFFFFFF
-        k1 = (k1 + PHILOX_KEY_B) & 0xFFFFFFFF
+        k0 = (k0 + PHILOX_KEY_A).to(tl.uint32)
+        k1 = (k1 + PHILOX_KEY_B).to(tl.uint32)
 
     return c0, c1, c2, c3
 
@@ -93,9 +93,9 @@ def generate_randn_kernel(
 
     c0, c1, c2, c3 = philox_4x32_10(
         counter.to(tl.uint32),
-        tl.zeros_like(counter, dtype=tl.uint32),
-        tl.zeros_like(counter, dtype=tl.uint32),
-        tl.zeros_like(counter, dtype=tl.uint32),
+        tl.zeros_like(counter).to(tl.uint32),
+        tl.zeros_like(counter).to(tl.uint32),
+        tl.zeros_like(counter).to(tl.uint32),
         seed
     )
 
