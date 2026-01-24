@@ -107,12 +107,12 @@ def generate_randn_kernel(
 
 def generate_randn(shape, seed, offset, device):
     """Generate tensor of N(0,1) values using Triton Philox RNG."""
-    n = np.prod(shape)
+    n = int(np.prod(shape))
     out = torch.empty(n, dtype=torch.float32, device=device)
 
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n, BLOCK_SIZE),)
-    generate_randn_kernel[grid](out, n, seed, offset, BLOCK_SIZE=BLOCK_SIZE)
+    generate_randn_kernel[grid](out, n, int(seed), int(offset), BLOCK_SIZE=BLOCK_SIZE)
 
     return out.view(shape)
 
