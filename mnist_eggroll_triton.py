@@ -350,7 +350,7 @@ def data_loader(X, y, batch_size, shuffle=True, generator=None):
     """Simple data loader with shuffling."""
     n = X.shape[0]
     if shuffle:
-        perm = torch.randperm(n, generator=generator)
+        perm = torch.randperm(n, device='cpu', generator=generator).to(X.device)
         X, y = X[perm], y[perm]
     for i in range(0, n, batch_size):
         yield X[i:i+batch_size], y[i:i+batch_size]
@@ -418,8 +418,8 @@ def main():
     # Initialize weights
     w1, w2, w3 = init_weights(784, config.hidden_dim, 10, device)
 
-    # RNG
-    rng = torch.Generator(device=device).manual_seed(420)
+    # RNG (CPU generator for randperm compatibility)
+    rng = torch.Generator(device='cpu').manual_seed(420)
 
     print(f"\nConfiguration:")
     print(f"  Population: {config.population}")
