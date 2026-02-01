@@ -206,7 +206,7 @@ training_config = TrainingConfig(
     sigma_decay=0.95,
     batch_size=128,
     epochs=10,
-    hidden_dim=256,
+    hidden_dim=128,
     population=39000
 )
 
