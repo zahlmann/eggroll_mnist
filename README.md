@@ -22,14 +22,14 @@ The most interesting part is the flexibility of ES / EGGROLL. E.g. here I used t
 
 ### Optimizations:
 
-The optimized EGGROLL implementation (mnist_eggroll_optimized.py) includes several key improvements over the naive implementation (mnist_eggroll.py) getting it from ~4x memory compared to backprop to ~1.2x memory and from 100x wall-clock time to ~10x wall-clock time:
+The optimized EGGROLL implementation (mnist_eggroll_optimized.py) includes several key improvements over the naive implementation (mnist_eggroll.py) getting it from ~4x memory compared to backprop to ~1.15x memory and from 100x wall-clock time to ~7x wall-clock time:
 
 1. **Antithetic sampling** - evaluate +σε and -σε together; reuses first layer computations and requires half the perturbation vectors
 2. **bfloat16 forward pass** - reduces memory (while experiments showed little impact on accuracy)
 3. **Fused vector generation** - single call generates all layer perturbations
 4. **Standardized fitness shaping** - uses mean/std normalization instead of rank-based (slight computational gain)
 5. **Orthogonal initialization** - gave me slightly better accuracy results than He initialization
-6. **Reduced population size** - 10,000 (20,000 effective) vs 39,000 before (keeping almost same accuracy due to above optimizations)
+6. **Reduced population size** - 8,000 (16,000 effective) vs 39,000 before (keeping almost same accuracy due to above optimizations)
 
 ### Background:
 
