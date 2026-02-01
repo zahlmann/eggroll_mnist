@@ -31,11 +31,11 @@ X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
 # Best hyperparameters from sweep
-LR_START = 0.005
+LR_START = 0.01
 LR_DECAY = 0.85
 SIGMA_START = 0.025
 SIGMA_DECAY = 0.999
-HALF_POPULATION = 10000
+HALF_POPULATION = 8000
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
