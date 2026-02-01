@@ -16,7 +16,7 @@ Both scripts use the same network architecture (3-layer MLP with 128 hidden unit
 
 ### Results:
 
-Both achieve ~97% accuracy on the test set (97.53% backprop, 97.14% EGGROLL). With the optimized implementation, EGGROLL uses similar memory (~460MB vs ~390MB) and is <10x slower (~38s vs ~5s).
+Both achieve ~97.5% accuracy on the test set (97.53% backprop, 97.46% EGGROLL). With the optimized implementation, EGGROLL uses almost the same memory (~450MB vs ~390MB) and is ~7x slower (~32s vs ~5s).
 
 The most interesting part is the flexibility of ES / EGGROLL. E.g. here I used the raw training accuracy as the fitness score. It is also possible to use any other signal, or any components in the network, regardless of differentiability because ES does not require gradients.
 
