@@ -7,6 +7,19 @@ import jax.numpy as jnp
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
 
+def get_gpu_memory_mb():
+    """Get current GPU memory usage in MB."""
+    try:
+        devices = jax.devices('gpu')
+        if devices:
+            jax.block_until_ready(jnp.zeros(1))
+            stats = devices[0].memory_stats()
+            if stats:
+                return stats.get('bytes_in_use', 0) / (1024 * 1024)
+    except:
+        pass
+    return 0.0
+
 # load data
 if not os.path.exists("mnist_prepped_float.npz"):
     print("Error: mnist_prepped_float.npz not found. Please run mnist_prep_float.py first.")
@@ -67,7 +80,7 @@ lr_start = 0.1
 lr_decay = 0.99
 batch_size = 128
 epochs = 10
-hidden_dim = 256
+hidden_dim = 128
 
 key = jax.random.PRNGKey(420)
 key, init_key = jax.random.split(key)
@@ -76,6 +89,7 @@ params = init_params(init_key, 784, hidden_dim, 10)
 
 print("Starting training...")
 start_time = time.perf_counter()
+peak_memory = 0.0
 
 for epoch in range(epochs):
     key, loader_key = jax.random.split(key)
@@ -86,6 +100,10 @@ for epoch in range(epochs):
     for xb, yb in data_loader(X_train, y_train, batch_size, loader_key):
         params, loss = train_step(params, xb, yb, lr)
         epoch_losses.append(float(loss))
+
+        current_mem = get_gpu_memory_mb()
+        if current_mem > peak_memory:
+            peak_memory = current_mem
 
     avg_loss = np.mean(epoch_losses)
 
@@ -107,5 +125,4 @@ for i in range(total):
 
 test_accuracy = (correct / total) * 100
 print(f"\nTest Accuracy: {test_accuracy:.2f}% ({correct}/{total})")
-
-print("Evaluation complete.")
+print(f"Peak GPU Memory: {peak_memory:.1f} MB")
