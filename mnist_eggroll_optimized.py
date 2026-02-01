@@ -5,9 +5,6 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.2'
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
-
 def get_gpu_memory_mb():
     """Get current GPU memory usage in MB."""
     try:
@@ -38,7 +35,7 @@ LR_START = 0.005
 LR_DECAY = 0.85
 SIGMA_START = 0.025
 SIGMA_DECAY = 0.999
-HALF_POPULATION = 1000
+HALF_POPULATION = 10000
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
@@ -89,7 +86,7 @@ def train_step_antithetic(w1, w2, w3, xb, yb,
     B3_f = B3.astype(jnp.bfloat16)
     sigma_f = jnp.bfloat16(sigma)
 
-    # === POSITIVE PERTURBATIONS (+sigma*e) ===
+    # Positive perturbations (+sigma*e)
     base1 = xb_f @ w1_f
     xB1 = xb_f @ B1_f.T
     pert1_pos = xB1.T[:, :, None] * A1_f[:, None, :]
@@ -104,7 +101,7 @@ def train_step_antithetic(w1, w2, w3, xb, yb,
     xB3_pos = jnp.einsum('pbh,ph->pb', l2_pos, B3_f)
     logits_pos = base3_pos + sigma_f * (xB3_pos[:, :, None] * A3_f[:, None, :])
 
-    # === NEGATIVE PERTURBATIONS (-sigma*e) ===
+    # Negative perturbations (-sigma*e)
     l1_neg = jax.nn.gelu(base1[None, :, :] - sigma_f * pert1_pos)
 
     base2_neg = (l1_neg.reshape(-1, w1_f.shape[1]) @ w2_f).reshape(half_pop, -1, w2_f.shape[1])
@@ -202,8 +199,8 @@ def main():
         avg_acc_epoch = sum(batch_accs) / len(batch_accs)
         epoch_time = time.perf_counter() - epoch_start
 
-        print(f"Epoch {epoch:2d} | Acc: {avg_acc_epoch:6.2%} | "
-              f"LR: {lr:.6f} | Sigma: {sigma:.6f} | Time: {epoch_time:.1f}s")
+        print(f"Epoch {epoch+1:2d} | Acc: {avg_acc_epoch:6.2%} | "
+              f"LR: {lr:.4f} | Sigma: {sigma:.4f} | Time: {epoch_time:.1f}s")
 
         lr *= LR_DECAY
         sigma *= SIGMA_DECAY

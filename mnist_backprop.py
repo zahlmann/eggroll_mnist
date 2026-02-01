@@ -4,9 +4,6 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
-
 def get_gpu_memory_mb():
     """Get current GPU memory usage in MB."""
     try:
@@ -92,6 +89,7 @@ start_time = time.perf_counter()
 peak_memory = 0.0
 
 for epoch in range(epochs):
+    epoch_start = time.perf_counter()
     key, loader_key = jax.random.split(key)
 
     lr = lr_start * (lr_decay ** epoch)
@@ -106,12 +104,12 @@ for epoch in range(epochs):
             peak_memory = current_mem
 
     avg_loss = np.mean(epoch_losses)
+    epoch_time = time.perf_counter() - epoch_start
 
-    print(f"Epoch {epoch+1:4d} | Avg Loss: {avg_loss:.4f} | LR: {lr:.4f}")
+    print(f"Epoch {epoch+1:2d} | Loss: {avg_loss:.4f} | LR: {lr:.4f} | Time: {epoch_time:.1f}s")
 
 end_time = time.perf_counter()
-print(f"Total training time: {end_time - start_time:.2f} seconds")
-print("Training completed. Starting evaluation.")
+print("\nEvaluating on test set...")
 
 correct = 0
 total = len(y_test)
@@ -123,6 +121,9 @@ for i in range(total):
     if pred == int(y_test[i]):
         correct += 1
 
-test_accuracy = (correct / total) * 100
-print(f"\nTest Accuracy: {test_accuracy:.2f}% ({correct}/{total})")
+test_accuracy = correct / total
+
+print()
+print(f"Test Accuracy: {test_accuracy:.2%} ({correct}/{total})")
+print(f"Training Time: {end_time - start_time:.2f}s")
 print(f"Peak GPU Memory: {peak_memory:.1f} MB")

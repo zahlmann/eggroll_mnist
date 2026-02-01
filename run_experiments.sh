@@ -10,7 +10,7 @@ else
 fi
 
 echo "Running EGGROLL..."
-uv run mnist_eggroll.py
+uv run mnist_eggroll_optimized.py
 
 echo "Running Backpropagation..."
 uv run mnist_backprop.py
