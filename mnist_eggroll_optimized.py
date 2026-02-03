@@ -30,12 +30,11 @@ y_train = jnp.array(data["y_train"])
 X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
-# Best hyperparameters from sweep (pop=7000 balanced config)
 LR_START = 0.012
 LR_DECAY = 0.88
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
-HALF_POPULATION = 7000
+HALF_POPULATION = 8000
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10

@@ -16,20 +16,20 @@ Both scripts use the same network architecture (3-layer MLP with 128 hidden unit
 
 ### Results:
 
-Both achieve ~97.5% accuracy on the test set (97.54% backprop, 97.26% EGGROLL). With the optimized implementation, EGGROLL uses almost the same memory (~448MB vs ~391MB) and is ~6x slower (~29s vs ~5s).
+Both achieve ~97.5% accuracy on the test set (97.54% backprop, 97.50% EGGROLL). With the optimized implementation, EGGROLL uses almost the same memory (~452MB vs ~391MB) and is ~7x slower (~31s vs ~4.6s).
 
 The most interesting part is the flexibility of ES / EGGROLL. E.g. here I used the raw training accuracy as the fitness score. It is also possible to use any other signal, or any components in the network, regardless of differentiability because ES does not require gradients.
 
 ### Optimizations:
 
-The optimized EGGROLL implementation (mnist_eggroll_optimized.py) includes several key improvements over the naive implementation (mnist_eggroll.py) getting it from ~4x memory compared to backprop to ~1.15x memory and from 100x wall-clock time to ~6x wall-clock time:
+The optimized EGGROLL implementation (mnist_eggroll_optimized.py) includes several key improvements over the naive implementation (mnist_eggroll.py) getting it from ~4x memory compared to backprop to ~1.15x memory and from 100x wall-clock time to ~7x wall-clock time:
 
 1. **Antithetic sampling** - evaluate +σε and -σε together; reuses first layer computations and requires half the perturbation vectors
 2. **bfloat16 forward pass** - reduces memory (while experiments showed little impact on accuracy)
 3. **Fused vector generation** - single call generates all layer perturbations
 4. **Standardized fitness shaping** - uses mean/std normalization instead of rank-based (slight computational gain)
 5. **Orthogonal initialization** - gave me slightly better accuracy results than He initialization
-6. **Tuned population size and LR** - 7,000 (14,000 effective with antithetic) with balanced LR/sigma config vs 39,000 before (keeping almost same accuracy due to above optimizations)
+6. **Tuned population size and LR** - 8,000 (16,000 effective with antithetic) with balanced LR/sigma config vs 39,000 before (keeping almost same accuracy due to above optimizations)
 
 ### Background:
 
