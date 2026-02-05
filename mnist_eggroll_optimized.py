@@ -224,4 +224,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with jax.profiler.trace("/tmp/eggroll_trace"):
+    	main()
