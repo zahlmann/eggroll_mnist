@@ -18,7 +18,7 @@ Both scripts use the same network architecture (3-layer MLP with 128 hidden unit
 
 Both achieve ~97.5% accuracy on the test set (97.54% backprop, ~97.4% EGGROLL). With the optimized implementation, EGGROLL uses almost the same memory (~433MB vs ~391MB) and is ~5x slower (~22s vs ~4.6s).
 
-The interesting part is the flexibility of ES. Since ES doesn't require gradients, the fitness signal can be anything. Here I use temperature-scaled cross-entropy (T=2.0) instead of raw accuracy, which gives a smoother fitness landscape and allows cutting the population from 8,000 to 5,000 for comparable accuracy.
+Since ES doesn't require gradients, the fitness signal can be anything. In some configurations raw accuracy works better, but here I use temperature-scaled cross-entropy (T=2.0) which gives a smoother fitness landscape and allows cutting the population from 8,000 to 5,000.
 
 ### Optimizations:
 
