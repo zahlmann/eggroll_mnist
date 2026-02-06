@@ -30,7 +30,7 @@ The optimized EGGROLL implementation (mnist_eggroll_optimized.py) includes sever
 4. **Standardized fitness shaping** - uses mean/std normalization instead of rank-based (slight computational gain)
 5. **Orthogonal initialization** - gave me slightly better accuracy results than He initialization
 6. **Tuned population size and LR** - 5,000 (10,000 effective with antithetic) with balanced LR/sigma config vs 39,000 before (keeping almost same accuracy due to above optimizations)
-7. **Temperature-scaled cross-entropy fitness** - using CE with T=2.0 instead of raw accuracy as the fitness signal gives smoother gradients, allowing the population reduction from 8,000 to 5,000 with almost no accuracy loss
+7. **Temperature-scaled cross-entropy fitness** - CE with T=2.0 instead of raw accuracy as fitness signal. Raw accuracy originally worked better in isolation, but combined with the other optimizations CE gives smoother gradients and enables the population cut from 8,000 to 5,000
 
 ### Background:
 
