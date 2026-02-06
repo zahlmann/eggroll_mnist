@@ -16,9 +16,9 @@ Both scripts use the same network architecture (3-layer MLP with 128 hidden unit
 
 ### Results:
 
-Both achieve ~97.5% accuracy on the test set (97.54% backprop, ~97.4% EGGROLL avg over 5 seeds). With the optimized implementation, EGGROLL uses almost the same memory (~433MB vs ~391MB) and is ~5x slower (~22s vs ~4.6s).
+Both achieve ~97.5% accuracy on the test set (97.54% backprop, ~97.4% EGGROLL). With the optimized implementation, EGGROLL uses almost the same memory (~433MB vs ~391MB) and is ~5x slower (~22s vs ~4.6s).
 
-The most interesting part is the flexibility of ES / EGGROLL. Here I use temperature-scaled cross-entropy (T=2.0) as the fitness signal rather than raw accuracy. Softening the logits before computing CE gives a smooth fitness landscape where every perturbation gets credit proportional to how much it improved model confidence — not just whether it flipped an argmax prediction. This smoother signal means each ES gradient estimate is less noisy, so we need fewer population members (5,000 vs the previous 8,000) for comparable accuracy. It is also possible to use any other signal, or any components in the network, regardless of differentiability because ES does not require gradients.
+The interesting part is the flexibility of ES. Since ES doesn't require gradients, the fitness signal can be anything. Here I use temperature-scaled cross-entropy (T=2.0) instead of raw accuracy, which gives a smoother fitness landscape and allows cutting the population from 8,000 to 5,000 for comparable accuracy.
 
 ### Optimizations:
 
@@ -30,7 +30,7 @@ The optimized EGGROLL implementation (mnist_eggroll_optimized.py) includes sever
 4. **Standardized fitness shaping** - uses mean/std normalization instead of rank-based (slight computational gain)
 5. **Orthogonal initialization** - gave me slightly better accuracy results than He initialization
 6. **Tuned population size and LR** - 5,000 (10,000 effective with antithetic) with balanced LR/sigma config vs 39,000 before (keeping almost same accuracy due to above optimizations)
-7. **Temperature-scaled cross-entropy fitness** - using CE with T=2.0 instead of raw accuracy as the fitness signal gives smoother gradients, allowing the population reduction from 8,000 to 5,000 with no accuracy loss
+7. **Temperature-scaled cross-entropy fitness** - using CE with T=2.0 instead of raw accuracy as the fitness signal gives smoother gradients, allowing the population reduction from 8,000 to 5,000 with almost no accuracy loss
 
 ### Background:
 

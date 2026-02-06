@@ -39,12 +39,8 @@ HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
 
-# Temperature for cross-entropy fitness. T>1 softens logits before computing CE,
-# giving a smoother fitness landscape. This lets the ES gradient estimate capture
-# small improvements in logit quality (not just argmax flips), so we need fewer
-# population members for the same accuracy. T=2.0 was optimal in our sweep over
-# T in {0.1, 0.3, 0.5, 1.0, 2.0}. T=1.0 is plain CE. T<1 sharpens and hurts.
-CE_TEMPERATURE = 2.0
+# Temperature for softmax smoothing in CE fitness (T>1 softens, T=1 is plain CE)
+T = 2.0
 
 
 def data_loader(X, y, batch_size, key, shuffle=True):
@@ -123,13 +119,7 @@ def train_step_antithetic(w1, w2, w3, xb, yb,
     logits_pos = logits_pos.astype(jnp.float32)
     logits_neg = logits_neg.astype(jnp.float32)
 
-    # Temperature-scaled cross-entropy fitness.
-    # Dividing logits by T>1 softens the probability distribution so that every
-    # perturbation gets a reward proportional to how much it improved model
-    # confidence, not just whether it flipped an argmax. This makes the fitness
-    # landscape smooth → less noisy ES gradients → fewer population members needed.
-    # (Old approach was raw accuracy which is a step function over logits.)
-    T = CE_TEMPERATURE
+    # Temperature-scaled CE fitness (smoother than raw accuracy → less noisy ES gradients)
     log_probs_pos = jax.nn.log_softmax(logits_pos / T, axis=-1)
     log_probs_neg = jax.nn.log_softmax(logits_neg / T, axis=-1)
     y_one_hot = jax.nn.one_hot(yb, 10)
