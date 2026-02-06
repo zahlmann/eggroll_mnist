@@ -16,9 +16,9 @@ Both scripts use the same network architecture (3-layer MLP with 128 hidden unit
 
 ### Results:
 
-Both achieve ~97.5% accuracy on the test set (97.54% backprop, 97.50% EGGROLL). With the optimized implementation, EGGROLL uses almost the same memory (~452MB vs ~391MB) and is ~7x slower (~31s vs ~4.6s).
+Both achieve ~97.5% accuracy on the test set (97.54% backprop, ~97.4% EGGROLL). With the optimized implementation, EGGROLL uses almost the same memory (~433MB vs ~391MB) and is ~5x slower (~22s vs ~4.6s).
 
-The most interesting part is the flexibility of ES / EGGROLL. E.g. here I used the raw training accuracy as the fitness score. It is also possible to use any other signal, or any components in the network, regardless of differentiability because ES does not require gradients.
+Since ES doesn't require gradients, the fitness signal can be anything. In some configurations raw accuracy works better, but here I use temperature-scaled cross-entropy (T=2.0) which gives a smoother fitness landscape and allows cutting the population from 8,000 to 5,000.
 
 ### Optimizations:
 
@@ -29,7 +29,8 @@ The optimized EGGROLL implementation (mnist_eggroll_optimized.py) includes sever
 3. **Fused vector generation** - single call generates all layer perturbations
 4. **Standardized fitness shaping** - uses mean/std normalization instead of rank-based (slight computational gain)
 5. **Orthogonal initialization** - gave me slightly better accuracy results than He initialization
-6. **Tuned population size and LR** - 8,000 (16,000 effective with antithetic) with balanced LR/sigma config vs 39,000 before (keeping almost same accuracy due to above optimizations)
+6. **Tuned population size and LR** - 5,000 (10,000 effective with antithetic) with balanced LR/sigma config vs 39,000 before (keeping almost same accuracy due to above optimizations)
+7. **Temperature-scaled cross-entropy fitness** - CE with T=2.0 instead of raw accuracy as fitness signal. Raw accuracy originally worked better in isolation, but combined with the other optimizations CE gives smoother gradients and enables the population cut from 8,000 to 5,000
 
 ### Background:
 

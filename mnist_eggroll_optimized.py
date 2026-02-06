@@ -34,10 +34,13 @@ LR_START = 0.012
 LR_DECAY = 0.88
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
-HALF_POPULATION = 8000
+HALF_POPULATION = 5000
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
+
+# Temperature for softmax smoothing in CE fitness (T>1 softens, T=1 is plain CE)
+T = 2.0
 
 
 def data_loader(X, y, batch_size, key, shuffle=True):
@@ -116,15 +119,20 @@ def train_step_antithetic(w1, w2, w3, xb, yb,
     logits_pos = logits_pos.astype(jnp.float32)
     logits_neg = logits_neg.astype(jnp.float32)
 
-    # Pure accuracy fitness: mean accuracy over batch
+    # Temperature-scaled CE fitness (smoother than raw accuracy → less noisy ES gradients)
+    log_probs_pos = jax.nn.log_softmax(logits_pos / T, axis=-1)
+    log_probs_neg = jax.nn.log_softmax(logits_neg / T, axis=-1)
+    y_one_hot = jax.nn.one_hot(yb, 10)
+    ce_pos = -jnp.sum(log_probs_pos * y_one_hot[None, :, :], axis=-1)
+    ce_neg = -jnp.sum(log_probs_neg * y_one_hot[None, :, :], axis=-1)
+    fitness_pos = -jnp.mean(ce_pos, axis=1)  # negate: lower CE = higher fitness
+    fitness_neg = -jnp.mean(ce_neg, axis=1)
+
+    # Accuracy for monitoring only (not used in gradient computation)
     preds_pos = jnp.argmax(logits_pos, axis=-1)
     preds_neg = jnp.argmax(logits_neg, axis=-1)
-
-    # Accuracy for each population member (mean over batch)
-    fitness_pos = jnp.mean(preds_pos == yb, axis=1)
-    fitness_neg = jnp.mean(preds_neg == yb, axis=1)
-
-    avg_accuracy = (fitness_pos.mean() + fitness_neg.mean()) / 2
+    avg_accuracy = (jnp.mean(preds_pos == yb, axis=1).mean() +
+                    jnp.mean(preds_neg == yb, axis=1).mean()) / 2
 
     # Antithetic gradient
     fitness_diff = fitness_pos - fitness_neg
