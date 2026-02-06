@@ -164,7 +164,7 @@ def evaluate_batch(w1, w2, w3, xb, yb):
 
 
 def main():
-    key = jax.random.PRNGKey(420)
+    key = jax.random.PRNGKey(11)
 
     # Initialize weights
     key, k1, k2, k3 = jax.random.split(key, 4)

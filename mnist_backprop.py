@@ -79,7 +79,7 @@ batch_size = 128
 epochs = 10
 hidden_dim = 128
 
-key = jax.random.PRNGKey(420)
+key = jax.random.PRNGKey(11)
 key, init_key = jax.random.split(key)
 
 params = init_params(init_key, 784, hidden_dim, 10)
