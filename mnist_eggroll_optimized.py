@@ -45,7 +45,7 @@ LR_DECAY = 0.88
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
-CHUNK = 1000  # process perturbations in chunks to keep intermediates in L2 cache
+CHUNK = 250  # process perturbations in chunks to keep intermediates in L2 cache
 N_CHUNKS = HALF_POPULATION // CHUNK
 
 
@@ -110,20 +110,20 @@ def train_step_antithetic(w1, w2, w3, xb, yb,
 
         # L1: (CHUNK, BATCH, HIDDEN)
         pert1 = sigma_f * xB1_T_ch[:, :, None] * A1_ch[:, None, :]
-        l1_pos = jax.nn.gelu((base1[None] + pert1).astype(jnp.float32)).astype(jnp.bfloat16)
-        l1_neg = jax.nn.gelu((base1[None] - pert1).astype(jnp.float32)).astype(jnp.bfloat16)
+        l1_pos = jax.nn.gelu(base1[None] + pert1)
+        l1_neg = jax.nn.gelu(base1[None] - pert1)
 
         # L2: batched matmul via reshape
         C = CHUNK
         base2_pos = (l1_pos.reshape(-1, HIDDEN_DIM) @ w2_f).reshape(C, -1, HIDDEN_DIM)
         xB2_pos = jnp.einsum('pbh,ph->pb', l1_pos, B2_ch)
         pert2_pos = sigma_f * xB2_pos[:, :, None] * A2_ch[:, None, :]
-        l2_pos = jax.nn.gelu((base2_pos + pert2_pos).astype(jnp.float32)).astype(jnp.bfloat16)
+        l2_pos = jax.nn.gelu(base2_pos + pert2_pos)
 
         base2_neg = (l1_neg.reshape(-1, HIDDEN_DIM) @ w2_f).reshape(C, -1, HIDDEN_DIM)
         xB2_neg = jnp.einsum('pbh,ph->pb', l1_neg, B2_ch)
         pert2_neg = sigma_f * xB2_neg[:, :, None] * A2_ch[:, None, :]
-        l2_neg = jax.nn.gelu((base2_neg - pert2_neg).astype(jnp.float32)).astype(jnp.bfloat16)
+        l2_neg = jax.nn.gelu(base2_neg - pert2_neg)
 
         # L3: logits
         base3_pos = (l2_pos.reshape(-1, HIDDEN_DIM) @ w3_f).reshape(C, -1, 10)
