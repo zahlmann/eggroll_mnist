@@ -45,7 +45,7 @@ LR_DECAY = 0.88
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
-CHUNK = 500
+CHUNK = 250
 N_CHUNKS = HALF_POPULATION // CHUNK
 N_BATCHES = (X_train.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 
