@@ -129,19 +129,16 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
             log_probs_neg = jax.nn.log_softmax(logits_neg / T, axis=-1)
             ce_pos = -jnp.sum(log_probs_pos * y_one_hot[None, :, :], axis=-1)
             ce_neg = -jnp.sum(log_probs_neg * y_one_hot[None, :, :], axis=-1)
-            fitness_pos = -jnp.mean(ce_pos, axis=1)
-            fitness_neg = -jnp.mean(ce_neg, axis=1)
+            # Compute diff directly (avoids storing pos and neg separately)
+            fitness_diff = jnp.mean(ce_neg - ce_pos, axis=1)  # higher when pos is better
 
-            return carry, (fitness_pos, fitness_neg)
+            return carry, fitness_diff
 
         inner_carry = (base1, w2_f, w3_f, sigma_f, y_one_hot)
         scan_data = (A1_c, xB1_T_c, A2_c, B2_c, A3_c, B3_c)
-        _, (fitness_pos, fitness_neg) = jax.lax.scan(chunk_forward, inner_carry, scan_data)
+        _, fitness_diff_chunks = jax.lax.scan(chunk_forward, inner_carry, scan_data)
 
-        fitness_pos = fitness_pos.reshape(-1)
-        fitness_neg = fitness_neg.reshape(-1)
-
-        fitness_diff = fitness_pos - fitness_neg
+        fitness_diff = fitness_diff_chunks.reshape(-1)
         mean = fitness_diff.mean()
         std = fitness_diff.std() + 1e-8
         shaped = (fitness_diff - mean) / std
