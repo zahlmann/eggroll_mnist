@@ -1,4 +1,5 @@
 import os
+os.environ["XLA_FLAGS"] = os.environ.get("XLA_FLAGS", "") + " --xla_gpu_autotune_level=4"
 import sys
 import time
 import argparse
