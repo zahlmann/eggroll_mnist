@@ -131,7 +131,7 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
 
         inner_carry = (base1, w2_f, w3_f, sigma_f, y_one_hot)
         scan_data = (A1_c, xB1_T_c, A2_c, B2_c, A3_c, B3_c)
-        _, (fitness_pos, fitness_neg) = jax.lax.scan(chunk_forward, inner_carry, scan_data, unroll=N_CHUNKS)
+        _, (fitness_pos, fitness_neg) = jax.lax.scan(chunk_forward, inner_carry, scan_data)
 
         fitness_pos = fitness_pos.reshape(-1)
         fitness_neg = fitness_neg.reshape(-1)
