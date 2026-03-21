@@ -72,8 +72,19 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         w1, w2, w3 = carry
         xb, yb, batch_key = batch_data
 
-        # Generate perturbation vectors in fp32
+        # Generate perturbation vectors in fp32, cast to bf16 once
         all_vecs = jax.random.normal(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32)
+        all_vecs_f = all_vecs.astype(jnp.bfloat16)
+
+        # bf16 slices for forward pass
+        B1_f = all_vecs_f[:, :784]
+        A1_f = all_vecs_f[:, 784:784+HIDDEN_DIM]
+        B2_f = all_vecs_f[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
+        A2_f = all_vecs_f[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM]
+        B3_f = all_vecs_f[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
+        A3_f = all_vecs_f[:, 784+4*HIDDEN_DIM:]
+
+        # fp32 slices for gradient computation
         B1 = all_vecs[:, :784]
         A1 = all_vecs[:, 784:784+HIDDEN_DIM]
         B2 = all_vecs[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
@@ -81,18 +92,10 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         B3 = all_vecs[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
         A3 = all_vecs[:, 784+4*HIDDEN_DIM:]
 
-        # Convert to bf16 for forward pass matmuls
         xb_f = xb.astype(jnp.bfloat16)
         w1_f = w1.astype(jnp.bfloat16)
         w2_f = w2.astype(jnp.bfloat16)
         w3_f = w3.astype(jnp.bfloat16)
-        sigma_f = jnp.bfloat16(sigma)
-        A1_f = A1.astype(jnp.bfloat16)
-        B1_f = B1.astype(jnp.bfloat16)
-        A2_f = A2.astype(jnp.bfloat16)
-        B2_f = B2.astype(jnp.bfloat16)
-        A3_f = A3.astype(jnp.bfloat16)
-        B3_f = B3.astype(jnp.bfloat16)
 
         base1 = xb_f @ w1_f
         xB1_T = B1_f @ xb_f.T
