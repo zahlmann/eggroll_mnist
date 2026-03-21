@@ -85,8 +85,8 @@ def _fused_3layer_ce_kernel(
 
         w2_k = tl.load(
             w2_ptr + offs_k[:, None] * HIDDEN + offs_h[None, :],
-        ).to(tl.bfloat16)
-        base2 = tl.dot(l1_k.to(tl.bfloat16), w2_k, base2)
+        ).to(tl.float8e4nv)
+        base2 = tl.dot(l1_k.to(tl.float8e4nv), w2_k, base2)
 
         B2_k = tl.load(B2_ptr + pid_p * HIDDEN + offs_k).to(tl.float32)
         xB2 += tl.sum(l1_k * B2_k[None, :], axis=1)
@@ -102,7 +102,7 @@ def _fused_3layer_ce_kernel(
     B3_row = tl.load(B3_ptr + pid_p * HIDDEN + offs_h).to(tl.float32)
     A3_row = tl.load(A3_ptr + pid_p * OUT_DIM_PAD + offs_o).to(tl.float32)
 
-    base3 = tl.dot(l2.to(tl.bfloat16), w3).to(tl.float32)
+    base3 = tl.dot(l2.to(tl.float8e4nv), w3.to(tl.float8e4nv)).to(tl.float32)
     xB3 = tl.sum(l2 * B3_row[None, :], axis=1)
     logits = base3 + sign_sigma * xB3[:, None] * A3_row[None, :]
 

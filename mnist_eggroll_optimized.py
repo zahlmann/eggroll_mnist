@@ -86,12 +86,12 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         w1_f = w1.astype(jnp.bfloat16)
         w2_f = w2.astype(jnp.bfloat16)
         w3_f = w3.astype(jnp.bfloat16)
-        A1_f = A1.astype(jnp.bfloat16)
         B1_f = B1.astype(jnp.bfloat16)
-        A2_f = A2.astype(jnp.bfloat16)
+        A1_f = A1.astype(jnp.bfloat16)
         B2_f = B2.astype(jnp.bfloat16)
-        A3_f = A3.astype(jnp.bfloat16)
+        A2_f = A2.astype(jnp.bfloat16)
         B3_f = B3.astype(jnp.bfloat16)
+        A3_f = A3.astype(jnp.bfloat16)
 
         base1 = xb_f @ w1_f
         xB1_T = B1_f @ xb_f.T
