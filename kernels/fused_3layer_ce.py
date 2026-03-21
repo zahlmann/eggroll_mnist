@@ -167,7 +167,7 @@ def fused_3layer_ce(base1, xB1_T, A1, w2, B2, A2, w3, B3, A3, sigma, T_val, sign
     _, HIDDEN = base1.shape
     OUT_DIM = w3.shape[1]
     OUT_DIM_PAD = 16
-    BLOCK_B = 32
+    BLOCK_B = 64
     BLOCK_K = 32
     N_TILES = triton.cdiv(BATCH, BLOCK_B)
 
