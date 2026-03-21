@@ -22,16 +22,16 @@ Epoch 10 | LR: 0.0038 | Sigma: 0.0275 | Time: 1.1s
 Evaluating on test set...
 
 Test Accuracy: 97.41% (9741/10000)
-Training Time: 10.69s
+Training Time: 10.67s
 Peak GPU Memory: 210.9 MB
 === RESULTS ===
 test_accuracy: 0.974100
-training_time_s: 10.69
+training_time_s: 10.67
 peak_memory_mb: 210.9
 ===============
 
 ==================================================
   accuracy : 0.9741  (baseline 0.9764)
-  time     : 10.7s  (6.22x speedup,  target ≤5.0s)
+  time     : 10.7s  (6.23x speedup,  target ≤5.0s)
   memory   : 211MB  (baseline 433MB)
 ==================================================

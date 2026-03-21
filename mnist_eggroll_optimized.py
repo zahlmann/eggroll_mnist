@@ -144,9 +144,10 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         scale = 1.0 / (2 * sigma * HALF_POPULATION)
         shaped_col = shaped[:, None]
 
-        grad1 = scale * (B1.astype(jnp.float32) * shaped_col).T @ A1.astype(jnp.float32)
-        grad2 = scale * (B2.astype(jnp.float32) * shaped_col).T @ A2.astype(jnp.float32)
-        grad3 = scale * (B3.astype(jnp.float32) * shaped_col).T @ A3.astype(jnp.float32)
+        # Restructure gradient: B.T @ (shaped * A) avoids large (5000, 784) intermediate
+        grad1 = scale * B1.astype(jnp.float32).T @ (shaped_col * A1.astype(jnp.float32))
+        grad2 = scale * B2.astype(jnp.float32).T @ (shaped_col * A2.astype(jnp.float32))
+        grad3 = scale * B3.astype(jnp.float32).T @ (shaped_col * A3.astype(jnp.float32))
 
         w1 = w1 + lr * grad1
         w2 = w2 + lr * grad2
