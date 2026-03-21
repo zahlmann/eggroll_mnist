@@ -55,6 +55,12 @@ Wrapping all 468 batches in `jax.lax.scan` eliminates Python loop overhead. AOT-
 - **Large population chunks (>500)**: intermediates overflow L2 cache
 - **unsafe_rbg PRNG**: accuracy dropped below threshold
 
+### Agent-driven optimization
+
+The kernel optimizations were developed using an autonomous coding agent loop, inspired by Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) approach. The agent reads `program.md` (which defines the experiment loop, constraints, and ideas), writes code, benchmarks, keeps or reverts, and iterates.
+
+To reproduce or extend: point a coding agent at `program.md` and let it run. The `cuda_kernels_docs/` directory contains Triton and jax-triton documentation for the agent to reference when writing GPU kernels.
+
 ### Background
 
 Implements the EGGROLL algorithm from ["Evolution Strategies at the Hyperscale"](https://arxiv.org/pdf/2511.16652) (Sarkar et al., 2025). EGGROLL uses low-rank (rank-1) perturbations so that perturbed forward passes never materialize full weight matrices: `x @ (W + sigma * outer(A, B)) = x @ W + sigma * (x @ B) * A`.
