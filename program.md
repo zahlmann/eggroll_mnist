@@ -96,7 +96,7 @@ A fused Triton kernel can avoid materializing this in HBM.
 ```
 1. Come up with a kernel idea (see Ideas section below)
 2. Implement it in mnist_eggroll_optimized.py (or kernels/)
-3. git add -A && git commit -m "description of change"
+3. git add -A && git commit -m "description of change" && git push
 4. uv run benchmark.py > run.log 2>&1
 5. Check: grep "test_accuracy\|training_time_s\|peak_memory_mb\|WARNING\|CRASHED" run.log
 6. If crashed → tail -50 run.log → fix the bug → go to step 2

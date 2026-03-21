@@ -6,7 +6,6 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from functools import partial
-from kernels.fused_l12 import fused_l12
 
 def get_gpu_memory_mb():
     """Get current GPU memory usage in MB."""
@@ -46,6 +45,9 @@ LR_DECAY = 0.88
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
+CHUNK = 500  # process perturbations in chunks to keep intermediates in L2 cache
+N_CHUNKS = HALF_POPULATION // CHUNK
+
 
 def data_loader(X, y, batch_size, key, shuffle=True):
     n = X.shape[0]
@@ -73,10 +75,6 @@ def generate_half_vectors(key, half_pop, input_dim, hidden_dim, output_dim):
 def train_step_antithetic(w1, w2, w3, xb, yb,
                           A1, B1, A2, B2, A3, B3,
                           sigma, lr, half_population):
-    """
-    Training step with antithetic sampling.
-    For each perturbation e, we evaluate both +sigma*e and -sigma*e.
-    """
     half_pop = half_population
 
     # Convert to bfloat16 for forward pass
@@ -92,41 +90,66 @@ def train_step_antithetic(w1, w2, w3, xb, yb,
     B3_f = B3.astype(jnp.bfloat16)
     sigma_f = jnp.bfloat16(sigma)
 
-    # Precompute base1 (shared across all pop members) and xB1_T (contiguous layout)
-    base1 = xb_f @ w1_f                           # (BATCH, HIDDEN)
-    xB1_T = B1_f @ xb_f.T                         # (HALF_POP, BATCH) — contiguous, coalesced reads
-    sigma_f32 = sigma.astype(jnp.float32)
+    # Precompute shared quantities
+    base1 = xb_f @ w1_f                    # (BATCH, HIDDEN)
+    xB1_T = B1_f @ xb_f.T                  # (HALF_POP, BATCH)
+    y_one_hot = jax.nn.one_hot(yb, 10)     # (BATCH, 10)
 
-    # Fused L1+L2 kernel: avoids materialising l1_pos/neg (~960 MB HBM/step)
-    l2_pos, l2_neg = fused_l12(base1, xB1_T, A1_f, w2_f, B2_f, A2_f, sigma_f32)
+    # Reshape perturbation vectors into chunks for scan
+    A1_c = A1_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
+    xB1_T_c = xB1_T.reshape(N_CHUNKS, CHUNK, BATCH_SIZE)
+    A2_c = A2_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
+    B2_c = B2_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
+    A3_c = A3_f.reshape(N_CHUNKS, CHUNK, 10)
+    B3_c = B3_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
 
-    # Layer 3 (remains in JAX/cuBLAS — l2 is (HALF_POP, BATCH, HIDDEN))
-    base3_pos = (l2_pos.reshape(-1, w2_f.shape[1]) @ w3_f).reshape(half_pop, -1, w3_f.shape[1])
-    xB3_pos = jnp.einsum('pbh,ph->pb', l2_pos, B3_f)
-    logits_pos = base3_pos + sigma_f * (xB3_pos[:, :, None] * A3_f[:, None, :])
+    def chunk_forward(carry, chunk_data):
+        base1, w2_f, w3_f, sigma_f, y_one_hot = carry
+        A1_ch, xB1_T_ch, A2_ch, B2_ch, A3_ch, B3_ch = chunk_data
 
-    base3_neg = (l2_neg.reshape(-1, w2_f.shape[1]) @ w3_f).reshape(half_pop, -1, w3_f.shape[1])
-    xB3_neg = jnp.einsum('pbh,ph->pb', l2_neg, B3_f)
-    logits_neg = base3_neg - sigma_f * (xB3_neg[:, :, None] * A3_f[:, None, :])
+        # L1: (CHUNK, BATCH, HIDDEN)
+        pert1 = sigma_f * xB1_T_ch[:, :, None] * A1_ch[:, None, :]
+        l1_pos = jax.nn.gelu((base1[None] + pert1).astype(jnp.float32)).astype(jnp.bfloat16)
+        l1_neg = jax.nn.gelu((base1[None] - pert1).astype(jnp.float32)).astype(jnp.bfloat16)
 
-    # Cast back to float32 for fitness
-    logits_pos = logits_pos.astype(jnp.float32)
-    logits_neg = logits_neg.astype(jnp.float32)
+        # L2: batched matmul via reshape
+        C = CHUNK
+        base2_pos = (l1_pos.reshape(-1, HIDDEN_DIM) @ w2_f).reshape(C, -1, HIDDEN_DIM)
+        xB2_pos = jnp.einsum('pbh,ph->pb', l1_pos, B2_ch)
+        pert2_pos = sigma_f * xB2_pos[:, :, None] * A2_ch[:, None, :]
+        l2_pos = jax.nn.gelu((base2_pos + pert2_pos).astype(jnp.float32)).astype(jnp.bfloat16)
 
-    # Temperature-scaled CE fitness (smoother than raw accuracy → less noisy ES gradients)
-    log_probs_pos = jax.nn.log_softmax(logits_pos / T, axis=-1)
-    log_probs_neg = jax.nn.log_softmax(logits_neg / T, axis=-1)
-    y_one_hot = jax.nn.one_hot(yb, 10)
-    ce_pos = -jnp.sum(log_probs_pos * y_one_hot[None, :, :], axis=-1)
-    ce_neg = -jnp.sum(log_probs_neg * y_one_hot[None, :, :], axis=-1)
-    fitness_pos = -jnp.mean(ce_pos, axis=1)  # negate: lower CE = higher fitness
-    fitness_neg = -jnp.mean(ce_neg, axis=1)
+        base2_neg = (l1_neg.reshape(-1, HIDDEN_DIM) @ w2_f).reshape(C, -1, HIDDEN_DIM)
+        xB2_neg = jnp.einsum('pbh,ph->pb', l1_neg, B2_ch)
+        pert2_neg = sigma_f * xB2_neg[:, :, None] * A2_ch[:, None, :]
+        l2_neg = jax.nn.gelu((base2_neg - pert2_neg).astype(jnp.float32)).astype(jnp.bfloat16)
 
-    # Accuracy for monitoring only (not used in gradient computation)
-    preds_pos = jnp.argmax(logits_pos, axis=-1)
-    preds_neg = jnp.argmax(logits_neg, axis=-1)
-    avg_accuracy = (jnp.mean(preds_pos == yb, axis=1).mean() +
-                    jnp.mean(preds_neg == yb, axis=1).mean()) / 2
+        # L3: logits
+        base3_pos = (l2_pos.reshape(-1, HIDDEN_DIM) @ w3_f).reshape(C, -1, 10)
+        xB3_pos = jnp.einsum('pbh,ph->pb', l2_pos, B3_ch)
+        logits_pos = (base3_pos + sigma_f * xB3_pos[:, :, None] * A3_ch[:, None, :]).astype(jnp.float32)
+
+        base3_neg = (l2_neg.reshape(-1, HIDDEN_DIM) @ w3_f).reshape(C, -1, 10)
+        xB3_neg = jnp.einsum('pbh,ph->pb', l2_neg, B3_ch)
+        logits_neg = (base3_neg - sigma_f * xB3_neg[:, :, None] * A3_ch[:, None, :]).astype(jnp.float32)
+
+        # CE fitness
+        log_probs_pos = jax.nn.log_softmax(logits_pos / T, axis=-1)
+        log_probs_neg = jax.nn.log_softmax(logits_neg / T, axis=-1)
+        ce_pos = -jnp.sum(log_probs_pos * y_one_hot[None, :, :], axis=-1)
+        ce_neg = -jnp.sum(log_probs_neg * y_one_hot[None, :, :], axis=-1)
+        fitness_pos = -jnp.mean(ce_pos, axis=1)
+        fitness_neg = -jnp.mean(ce_neg, axis=1)
+
+        return carry, (fitness_pos, fitness_neg)
+
+    carry = (base1, w2_f, w3_f, sigma_f, y_one_hot)
+    scan_data = (A1_c, xB1_T_c, A2_c, B2_c, A3_c, B3_c)
+    _, (fitness_pos, fitness_neg) = jax.lax.scan(chunk_forward, carry, scan_data)
+
+    # Flatten: (N_CHUNKS, CHUNK) → (HALF_POP,)
+    fitness_pos = fitness_pos.reshape(-1)
+    fitness_neg = fitness_neg.reshape(-1)
 
     # Antithetic gradient
     fitness_diff = fitness_pos - fitness_neg
@@ -145,7 +168,7 @@ def train_step_antithetic(w1, w2, w3, xb, yb,
     w2 = w2 + lr * grad2
     w3 = w3 + lr * grad3
 
-    return w1, w2, w3, avg_accuracy
+    return w1, w2, w3
 
 
 @jax.jit
@@ -192,30 +215,25 @@ def main():
         epoch_start = time.perf_counter()
         key, data_key = jax.random.split(key)
 
-        batch_accs = []
         for xb, yb in data_loader(X_train, y_train, BATCH_SIZE, data_key):
             key, vec_key = jax.random.split(key)
             A1, B1, A2, B2, A3, B3 = generate_half_vectors(
                 vec_key, HALF_POPULATION, 784, HIDDEN_DIM, 10
             )
 
-            w1, w2, w3, avg_acc = train_step_antithetic(
+            w1, w2, w3 = train_step_antithetic(
                 w1, w2, w3, xb, yb,
                 A1, B1, A2, B2, A3, B3,
                 sigma, lr, HALF_POPULATION,
             )
-            batch_accs.append(float(avg_acc))
 
             # Track peak memory
             current_mem = get_gpu_memory_mb()
             if current_mem > peak_memory:
                 peak_memory = current_mem
 
-        avg_acc_epoch = sum(batch_accs) / len(batch_accs)
         epoch_time = time.perf_counter() - epoch_start
-
-        print(f"Epoch {epoch+1:2d} | Acc: {avg_acc_epoch:6.2%} | "
-              f"LR: {lr:.4f} | Sigma: {sigma:.4f} | Time: {epoch_time:.1f}s")
+        print(f"Epoch {epoch+1:2d} | LR: {lr:.4f} | Sigma: {sigma:.4f} | Time: {epoch_time:.1f}s")
 
         lr *= LR_DECAY
         sigma *= SIGMA_DECAY
