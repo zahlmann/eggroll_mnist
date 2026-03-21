@@ -7,6 +7,11 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 
+
+def fast_gelu(x):
+    """Sigmoid-based GELU approximation (GPT-2 style). Fewer FLOPs, simpler for XLA to fuse."""
+    return x * jax.nn.sigmoid(1.702 * x)
+
 def get_gpu_memory_mb():
     """Get current GPU memory usage in MB."""
     try:
@@ -108,16 +113,16 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
 
             C = CHUNK
             pert1 = sigma_f * xB1_T_ch[:, :, None] * A1_ch[:, None, :]
-            l1_pos = jax.nn.gelu(base1[None] + pert1)
-            l1_neg = jax.nn.gelu(base1[None] - pert1)
+            l1_pos = fast_gelu(base1[None] + pert1)
+            l1_neg = fast_gelu(base1[None] - pert1)
 
             base2_pos = (l1_pos.reshape(-1, HIDDEN_DIM) @ w2_f).reshape(C, -1, HIDDEN_DIM)
             xB2_pos = (l1_pos * B2_ch[:, None, :]).sum(axis=-1)
-            l2_pos = jax.nn.gelu(base2_pos + sigma_f * xB2_pos[:, :, None] * A2_ch[:, None, :])
+            l2_pos = fast_gelu(base2_pos + sigma_f * xB2_pos[:, :, None] * A2_ch[:, None, :])
 
             base2_neg = (l1_neg.reshape(-1, HIDDEN_DIM) @ w2_f).reshape(C, -1, HIDDEN_DIM)
             xB2_neg = (l1_neg * B2_ch[:, None, :]).sum(axis=-1)
-            l2_neg = jax.nn.gelu(base2_neg - sigma_f * xB2_neg[:, :, None] * A2_ch[:, None, :])
+            l2_neg = fast_gelu(base2_neg - sigma_f * xB2_neg[:, :, None] * A2_ch[:, None, :])
 
             base3_pos = (l2_pos.reshape(-1, HIDDEN_DIM) @ w3_f).reshape(C, -1, 10)
             xB3_pos = (l2_pos * B3_ch[:, None, :]).sum(axis=-1)
