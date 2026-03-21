@@ -6,6 +6,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from functools import partial
+from kernels.fused_3layer_ce import fused_3layer_ce
 
 
 def fast_gelu(x):
@@ -50,8 +51,6 @@ LR_DECAY = 0.88
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
-CHUNK = 500
-N_CHUNKS = HALF_POPULATION // CHUNK
 N_BATCHES = (X_train.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 
 
@@ -97,55 +96,24 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
 
         base1 = xb_f @ w1_f
         xB1_T = B1_f @ xb_f.T
-        y_one_hot = jax.nn.one_hot(yb, 10)
+        sigma_f32 = sigma.astype(jnp.float32)
+        T_f32 = jnp.float32(T)
 
-        # Reshape for scan over chunks
-        A1_c = A1_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
-        xB1_T_c = xB1_T.reshape(N_CHUNKS, CHUNK, BATCH_SIZE)
-        A2_c = A2_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
-        B2_c = B2_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
-        A3_c = A3_f.reshape(N_CHUNKS, CHUNK, 10)
-        B3_c = B3_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
+        # Fused 3-layer kernel: one call per direction, no intermediate HBM writes
+        pos_sign = jnp.float32(1.0)
+        neg_sign = jnp.float32(-1.0)
 
-        def chunk_forward(carry, chunk_data):
-            base1, w2_f, w3_f, sigma_f, y_one_hot = carry
-            A1_ch, xB1_T_ch, A2_ch, B2_ch, A3_ch, B3_ch = chunk_data
+        partial_ce_pos = fused_3layer_ce(
+            base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
+            sigma_f32, T_f32, pos_sign, yb)
+        partial_ce_neg = fused_3layer_ce(
+            base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
+            sigma_f32, T_f32, neg_sign, yb)
 
-            C = CHUNK
-            pert1 = sigma_f * xB1_T_ch[:, :, None] * A1_ch[:, None, :]
-            l1_pos = fast_gelu(base1[None] + pert1)
-            l1_neg = fast_gelu(base1[None] - pert1)
-
-            base2_pos = (l1_pos.reshape(-1, HIDDEN_DIM) @ w2_f).reshape(C, -1, HIDDEN_DIM)
-            xB2_pos = (l1_pos * B2_ch[:, None, :]).sum(axis=-1)
-            l2_pos = fast_gelu(base2_pos + sigma_f * xB2_pos[:, :, None] * A2_ch[:, None, :])
-
-            base2_neg = (l1_neg.reshape(-1, HIDDEN_DIM) @ w2_f).reshape(C, -1, HIDDEN_DIM)
-            xB2_neg = (l1_neg * B2_ch[:, None, :]).sum(axis=-1)
-            l2_neg = fast_gelu(base2_neg - sigma_f * xB2_neg[:, :, None] * A2_ch[:, None, :])
-
-            base3_pos = (l2_pos.reshape(-1, HIDDEN_DIM) @ w3_f).reshape(C, -1, 10)
-            xB3_pos = (l2_pos * B3_ch[:, None, :]).sum(axis=-1)
-            logits_pos = (base3_pos + sigma_f * xB3_pos[:, :, None] * A3_ch[:, None, :]).astype(jnp.float32)
-
-            base3_neg = (l2_neg.reshape(-1, HIDDEN_DIM) @ w3_f).reshape(C, -1, 10)
-            xB3_neg = (l2_neg * B3_ch[:, None, :]).sum(axis=-1)
-            logits_neg = (base3_neg - sigma_f * xB3_neg[:, :, None] * A3_ch[:, None, :]).astype(jnp.float32)
-
-            log_probs_pos = jax.nn.log_softmax(logits_pos / T, axis=-1)
-            log_probs_neg = jax.nn.log_softmax(logits_neg / T, axis=-1)
-            ce_pos = -jnp.sum(log_probs_pos * y_one_hot[None, :, :], axis=-1)
-            ce_neg = -jnp.sum(log_probs_neg * y_one_hot[None, :, :], axis=-1)
-            # Compute diff directly (avoids storing pos and neg separately)
-            fitness_diff = jnp.mean(ce_neg - ce_pos, axis=1)  # higher when pos is better
-
-            return carry, fitness_diff
-
-        inner_carry = (base1, w2_f, w3_f, sigma_f, y_one_hot)
-        scan_data = (A1_c, xB1_T_c, A2_c, B2_c, A3_c, B3_c)
-        _, fitness_diff_chunks = jax.lax.scan(chunk_forward, inner_carry, scan_data)
-
-        fitness_diff = fitness_diff_chunks.reshape(-1)
+        # Reduce partial CE across batch tiles
+        ce_pos = partial_ce_pos.sum(axis=1) / BATCH_SIZE
+        ce_neg = partial_ce_neg.sum(axis=1) / BATCH_SIZE
+        fitness_diff = ce_neg - ce_pos  # higher when pos is better
         mean = fitness_diff.mean()
         std = fitness_diff.std() + 1e-8
         shaped = (fitness_diff - mean) / std
