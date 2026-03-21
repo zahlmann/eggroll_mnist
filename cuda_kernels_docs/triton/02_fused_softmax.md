@@ -1,0 +1,383 @@
+Source: https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
+
+Note
+
+
+Go to the end
+to download the full example code.
+
+
+# Fused Softmax¶
+
+
+In this tutorial, you will write a fused softmax operation that is significantly faster
+than PyTorch’s native op for a particular class of matrices: those whose rows can fit in
+the GPU’s SRAM.
+
+
+In doing so, you will learn about:
+
+
+- 
+
+The benefits of kernel fusion for bandwidth-bound operations.
+
+- 
+
+Reduction operators in Triton.
+
+
+## Motivations¶
+
+
+Custom GPU kernels for elementwise additions are educationally valuable but won’t get you very far in practice.
+Let us consider instead the case of a simple (numerically stabilized) softmax operation:
+
+```
+import torch
+
+import triton
+import triton.language as tl
+from triton.runtime import driver
+
+DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+
+def is_cdna():
+    return is_hip() and triton.runtime.driver.active.get_current_target().arch in ('gfx940', 'gfx941', 'gfx942',
+                                                                                   'gfx90a', 'gfx908')
+
+
+def naive_softmax(x):
+    """Compute row-wise softmax of X using native pytorch
+
+    We subtract the maximum element in order to avoid overflows. Softmax is invariant to
+    this shift.
+    """
+    # read  MN elements ; write M  elements
+    x_max = x.max(dim=1)[0]
+    # read MN + M elements ; write MN elements
+    z = x - x_max[:, None]
+    # read  MN elements ; write MN elements
+    numerator = torch.exp(z)
+    # read  MN elements ; write M  elements
+    denominator = numerator.sum(dim=1)
+    # read MN + M elements ; write MN elements
+    ret = numerator / denominator[:, None]
+    # in total: read 5MN + 2M elements ; wrote 3MN + 2M elements
+    return ret
+
+```
+
+
+When implemented naively in PyTorch, computing `y = naive_softmax(x)` for \(x \in R^{M \times N}\)
+requires reading \(5MN + 2M\) elements from DRAM and writing back \(3MN + 2M\) elements.
+This is obviously wasteful; we’d prefer to have a custom “fused” kernel that only reads
+X once and does all the necessary computations on-chip.
+Doing so would require reading and writing back only \(MN\) bytes, so we could
+expect a theoretical speed-up of ~4x (i.e., \((8MN + 4M) / 2MN\)).
+The torch.jit.script flags aims to perform this kind of “kernel fusion” automatically
+but, as we will see later, it is still far from ideal.
+
+
+## Compute Kernel¶
+
+
+Our softmax kernel works as follows: each program loads a set of rows of the input matrix X strided by number of programs,
+normalizes it and writes back the result to the output Y.
+
+
+Note that one important limitation of Triton is that each block must have a
+power-of-two number of elements, so we need to internally “pad” each row and guard the
+memory operations properly if we want to handle any possible input shapes:
+
+```
+@triton.jit
+def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n_rows, n_cols, BLOCK_SIZE: tl.constexpr,
+                   num_stages: tl.constexpr):
+    # starting row of the program
+    row_start = tl.program_id(0)
+    row_step = tl.num_programs(0)
+    for row_idx in tl.range(row_start, n_rows, row_step, num_stages=num_stages):
+        # The stride represents how much we need to increase the pointer to advance 1 row
+        row_start_ptr = input_ptr + row_idx * input_row_stride
+        # The block size is the next power of two greater than n_cols, so we can fit each
+        # row in a single block
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        input_ptrs = row_start_ptr + col_offsets
+        # Load the row into SRAM, using a mask since BLOCK_SIZE may be > than n_cols
+        mask = col_offsets < n_cols
+        row = tl.load(input_ptrs, mask=mask, other=-float('inf'))
+        # Subtract maximum for numerical stability
+        row_minus_max = row - tl.max(row, axis=0)
+        # Note that exponentiation in Triton is fast but approximate (i.e., think __expf in CUDA)
+        numerator = tl.exp(row_minus_max)
+        denominator = tl.sum(numerator, axis=0)
+        softmax_output = numerator / denominator
+        # Write back output to DRAM
+        output_row_start_ptr = output_ptr + row_idx * output_row_stride
+        output_ptrs = output_row_start_ptr + col_offsets
+        tl.store(output_ptrs, softmax_output, mask=mask)
+
+```
+
+
+We can create a helper function that enqueues the kernel and its (meta-)arguments for any given input tensor.
+
+```
+properties = driver.active.utils.get_device_properties(DEVICE.index)
+NUM_SM = properties["multiprocessor_count"]
+NUM_REGS = properties["max_num_regs"]
+SIZE_SMEM = properties["max_shared_mem"]
+WARP_SIZE = properties["warpSize"]
+target = triton.runtime.driver.active.get_current_target()
+kernels = {}
+
+
+def softmax(x):
+    n_rows, n_cols = x.shape
+
+    # The block size of each loop iteration is the smallest power of two greater than the number of columns in `x`
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+
+    # Another trick we can use is to ask the compiler to use more threads per row by
+    # increasing the number of warps (`num_warps`) over which each row is distributed.
+    # You will see in the next tutorial how to auto-tune this value in a more natural
+    # way so you don't have to come up with manual heuristics yourself.
+    num_warps = 8
+
+    # Number of software pipelining stages.
+    num_stages = 4 if SIZE_SMEM > 200000 else 2
+
+    # Allocate output
+    y = torch.empty_like(x)
+
+    # pre-compile kernel to get register usage and compute thread occupancy.
+    kernel = softmax_kernel.warmup(y, x, x.stride(0), y.stride(0), n_rows, n_cols, BLOCK_SIZE=BLOCK_SIZE,
+                                   num_stages=num_stages, num_warps=num_warps, grid=(1, ))
+    kernel._init_handles()
+    n_regs = kernel.n_regs
+    size_smem = kernel.metadata.shared
+    if is_hip():
+        # NUM_REGS represents the number of regular purpose registers. On CDNA architectures this is half of all registers available.
+        # However, this is not always the case. In most cases all registers can be used as regular purpose registers.
+        # ISA SECTION (3.6.4 for CDNA3)
+        # VGPRs are allocated out of two pools: regular VGPRs and accumulation VGPRs. Accumulation VGPRs are used
+        # with matrix VALU instructions, and can also be loaded directly from memory. A wave may have up to 512 total
+        # VGPRs, 256 of each type. When a wave has fewer than 512 total VGPRs, the number of each type is flexible - it is
+        # not required to be equal numbers of both types.
+        NUM_GPRS = NUM_REGS
+        if is_cdna():
+            NUM_GPRS = NUM_REGS * 2
+
+        # MAX_NUM_THREADS represents maximum number of resident threads per multi-processor.
+        # When we divide this number with WARP_SIZE we get maximum number of waves that can
+        # execute on a CU (multi-processor)  in parallel.
+        MAX_NUM_THREADS = properties["max_threads_per_sm"]
+        max_num_waves = MAX_NUM_THREADS // WARP_SIZE
+        occupancy = min(NUM_GPRS // WARP_SIZE // n_regs, max_num_waves) // num_warps
+    else:
+        occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
+    occupancy = min(occupancy, SIZE_SMEM // size_smem)
+    num_programs = NUM_SM * occupancy
+
+    num_programs = min(num_programs, n_rows)
+
+    # Create a number of persistent programs.
+    kernel[(num_programs, 1, 1)](y, x, x.stride(0), y.stride(0), n_rows, n_cols, BLOCK_SIZE, num_stages)
+    return y
+
+```
+
+
+## Unit Test¶
+
+
+We make sure that we test our kernel on a matrix with an irregular number of rows and columns.
+This will allow us to verify that our padding mechanism works.
+
+```
+torch.manual_seed(0)
+x = torch.randn(1823, 781, device=DEVICE)
+y_triton = softmax(x)
+y_torch = torch.softmax(x, axis=1)
+assert torch.allclose(y_triton, y_torch), (y_triton, y_torch)
+
+```
+
+
+As expected, the results are identical.
+
+
+## Benchmark¶
+
+
+Here we will benchmark our operation as a function of the number of columns in the input matrix – assuming 4096 rows.
+We will then compare its performance against (1) `torch.softmax` and (2) the `naive_softmax` defined above.
+
+```
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['N'],  # argument names to use as an x-axis for the plot
+        x_vals=[128 * i for i in range(2, 100)],  # different possible values for `x_name`
+        line_arg='provider',  # argument name whose value corresponds to a different line in the plot
+        line_vals=['triton', 'torch', 'naive_softmax'],  # possible values for `line_arg``
+        line_names=["Triton", "Torch", "Naive Softmax"],  # label name for the lines
+        styles=[('blue', '-'), ('green', '-'), ('red', '-')],  # line styles
+        ylabel="GB/s",  # label name for the y-axis
+        plot_name="softmax-performance",  # name for the plot. Used also as a file name for saving the plot.
+        args={'M': 4096},  # values for function arguments not in `x_names` and `y_name`
+    ))
+def benchmark(M, N, provider):
+    x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+    stream = getattr(torch, DEVICE.type).Stream()
+    getattr(torch, DEVICE.type).set_stream(stream)
+    if provider == 'torch':
+        ms = triton.testing.do_bench(lambda: torch.softmax(x, axis=-1))
+    if provider == 'triton':
+        ms = triton.testing.do_bench(lambda: softmax(x))
+    if provider == 'naive_softmax':
+        ms = triton.testing.do_bench(lambda: naive_softmax(x))
+    gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+    return gbps(ms)
+
+
+benchmark.run(show_plots=True, print_data=True)
+
+```
+
+
+```
+softmax-performance:
+          N  Triton (GB/s)  Torch (GB/s)  Naive Softmax (GB/s)
+0     256.0     511.678056    688.912797            206.815581
+1     384.0     711.240931    816.696716            264.147970
+2     512.0     840.422080    930.559516            304.770505
+3     640.0     836.218816    920.679312            332.753983
+4     768.0     910.042937    980.592764            350.858367
+5     896.0     972.490452   1029.617035            355.121190
+6    1024.0    1019.785533   1080.285098            354.399517
+7    1152.0    1024.375800   1068.578443            350.228734
+8    1280.0    1082.380791   1113.305048            348.863835
+9    1408.0    1114.677789   1133.862475            341.129506
+10   1536.0    1144.830887   1158.851801            333.651384
+11   1664.0    1183.012726   1191.149659            329.558088
+12   1792.0    1205.967111   1200.908155            325.464656
+13   1920.0    1229.297260   1220.095834            325.111941
+14   2048.0    1255.478939   1248.693410            324.702517
+15   2176.0    1187.943582    960.225735            325.979496
+16   2304.0    1201.425189   1004.746627            326.301096
+17   2432.0    1228.404169   1034.793289            326.889438
+18   2560.0    1248.718649   1068.365904            328.598424
+19   2688.0    1256.304614   1100.996644            329.107723
+20   2816.0    1273.062246   1126.132538            329.888342
+21   2944.0    1293.129238   1148.272155            331.807780
+22   3072.0    1306.076163   1170.721260            333.450229
+23   3200.0    1320.044044   1170.496243            334.855197
+24   3328.0    1323.271669   1197.260092            336.878105
+25   3456.0    1332.103685   1219.853054            336.921714
+26   3584.0    1337.838084   1243.944902            338.611309
+27   3712.0    1355.107890   1263.094116            340.792686
+28   3840.0    1359.658285   1285.773605            340.736845
+29   3968.0    1363.756525   1302.078272            341.443678
+30   4096.0    1373.974670   1318.012593            338.701609
+31   4224.0    1336.212351   1276.181004            343.325963
+32   4352.0    1349.066299   1296.438010            345.464180
+33   4480.0    1354.237170   1320.668627            345.843306
+34   4608.0    1366.902320   1336.624700            346.974391
+35   4736.0    1367.043836   1349.495552            347.966873
+36   4864.0    1374.059116   1362.751251            349.304570
+37   4992.0    1371.023054   1373.477519            350.164106
+38   5120.0    1385.005921   1388.245804            350.897732
+39   5248.0    1379.546782   1359.299417            352.003555
+40   5376.0    1384.998003   1373.563017            352.104095
+41   5504.0    1392.689975   1380.111820            353.628359
+42   5632.0    1400.572729   1397.625423            353.110879
+43   5760.0    1402.670873   1403.223088            355.228896
+44   5888.0    1397.662634   1406.150583            354.999527
+45   6016.0    1410.793702   1418.249856            356.848083
+46   6144.0    1414.190097   1433.112558            357.144414
+47   6272.0    1412.635770   1398.806153            357.955338
+48   6400.0    1416.627609   1408.755811            358.807617
+49   6528.0    1416.166374   1427.321767            359.642618
+50   6656.0    1420.574039   1427.126047            360.041797
+51   6784.0    1424.212337   1443.087400            360.417869
+52   6912.0    1431.160531   1438.493447            361.024635
+53   7040.0    1428.817013   1461.216088            360.779801
+54   7168.0    1431.222556   1455.419606            361.920702
+55   7296.0    1432.763548   1088.842373            362.909845
+56   7424.0    1435.456178   1099.645226            363.221956
+57   7552.0    1433.085522   1110.266785            363.518395
+58   7680.0    1435.219865   1123.779626            363.673392
+59   7808.0    1438.621105   1132.816311            364.753284
+60   7936.0    1439.433200   1146.227015            364.760615
+61   8064.0    1436.997164   1148.895092            365.266547
+62   8192.0    1438.855195   1148.943471            363.887623
+63   8320.0    1388.346302   1118.332067            361.429446
+64   8448.0    1385.540109   1126.856228            362.434185
+65   8576.0    1388.157358   1125.614182            363.481677
+66   8704.0    1384.954557   1135.456719            364.373783
+67   8832.0    1396.602497   1132.017878            365.133937
+68   8960.0    1387.303984   1142.025191            365.900971
+69   9088.0    1398.718505   1135.867837            366.831180
+70   9216.0    1407.345191   1141.944165            367.276087
+71   9344.0    1394.662437   1423.334139            367.752166
+72   9472.0    1400.931700   1432.849407            368.748543
+73   9600.0    1400.828434   1427.291599            369.437089
+74   9728.0    1395.744293   1440.560737            369.825564
+75   9856.0    1399.769648   1443.772048            370.133618
+76   9984.0    1400.541946   1448.506680            370.768762
+77  10112.0    1409.262817   1452.280035            371.588603
+78  10240.0    1406.278620   1468.171475            371.634595
+79  10368.0    1412.653323   1461.999336            370.170213
+80  10496.0    1409.452767   1465.800255            370.879832
+81  10624.0    1405.874042   1464.056112            371.059526
+82  10752.0    1397.147254   1472.152850            371.528532
+83  10880.0    1398.754387   1480.932966            371.714295
+84  11008.0    1416.135326   1475.850520            373.054856
+85  11136.0    1417.886511   1483.248706            373.312255
+86  11264.0    1413.298890   1487.240139            372.615832
+87  11392.0    1420.611512   1490.463236            374.217744
+88  11520.0    1411.863274   1497.120697            374.143382
+89  11648.0    1422.485291   1498.684039            374.427529
+90  11776.0    1436.150379   1501.526347            374.784079
+91  11904.0    1431.464851   1509.138387            375.450043
+92  12032.0    1419.586049   1508.824495            376.460657
+93  12160.0    1411.605987   1516.550581            376.236210
+94  12288.0    1424.047703   1418.864622            376.700874
+95  12416.0    1437.644341   1396.407272            374.981824
+96  12544.0    1440.069609   1391.728330            375.182728
+97  12672.0    1430.593378   1392.111382            375.356690
+
+```
+
+
+In the above plot, we can see that:
+
+- 
+
+Triton is 4x faster than the Torch JIT. This confirms our suspicions that the Torch JIT does not do any fusion here.
+
+- 
+
+Triton is noticeably faster than `torch.softmax` – in addition to being **easier to read, understand and maintain**.
+Note however that the PyTorch softmax operation is more general and will work on tensors of any shape.
+
+
+**Total running time of the script:** (0 minutes 34.817 seconds)
+
+
+`Download Jupyter notebook: 02-fused-softmax.ipynb`
+
+
+`Download Python source code: 02-fused-softmax.py`
+
+
+`Download zipped: 02-fused-softmax.zip`
+
+
+Gallery generated by Sphinx-Gallery
