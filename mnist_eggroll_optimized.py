@@ -53,19 +53,23 @@ N_BATCHES = (X_train.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 @jax.jit
 def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
     """Process an entire epoch in a single JIT call using nested scan."""
+    n_batches = X_batched.shape[0]
+
+    # Pre-split all random keys for the epoch (avoids key splitting inside scan)
+    all_keys = jax.random.split(key, n_batches * 6 + 1)
+    key = all_keys[0]
+    vec_keys = all_keys[1:].reshape(n_batches, 6, -1)
 
     def batch_step(carry, batch_data):
-        w1, w2, w3, key = carry
-        xb, yb = batch_data  # xb is already bf16
+        w1, w2, w3 = carry
+        xb, yb, batch_keys = batch_data  # xb is already bf16
 
-        key, vec_key = jax.random.split(key)
-        keys = jax.random.split(vec_key, 6)
-        A1 = jax.random.normal(keys[0], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
-        B1 = jax.random.normal(keys[1], (HALF_POPULATION, 784), dtype=jnp.float32)
-        A2 = jax.random.normal(keys[2], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
-        B2 = jax.random.normal(keys[3], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
-        A3 = jax.random.normal(keys[4], (HALF_POPULATION, 10), dtype=jnp.float32)
-        B3 = jax.random.normal(keys[5], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
+        A1 = jax.random.normal(batch_keys[0], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
+        B1 = jax.random.normal(batch_keys[1], (HALF_POPULATION, 784), dtype=jnp.float32)
+        A2 = jax.random.normal(batch_keys[2], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
+        B2 = jax.random.normal(batch_keys[3], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
+        A3 = jax.random.normal(batch_keys[4], (HALF_POPULATION, 10), dtype=jnp.float32)
+        B3 = jax.random.normal(batch_keys[5], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
 
         w1_f = w1.astype(jnp.bfloat16)
         w2_f = w2.astype(jnp.bfloat16)
@@ -147,9 +151,9 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         w2 = w2 + lr * grad2
         w3 = w3 + lr * grad3
 
-        return (w1, w2, w3, key), None
+        return (w1, w2, w3), None
 
-    (w1, w2, w3, key), _ = jax.lax.scan(batch_step, (w1, w2, w3, key), (X_batched, y_batched))
+    (w1, w2, w3), _ = jax.lax.scan(batch_step, (w1, w2, w3), (X_batched, y_batched, vec_keys))
     return w1, w2, w3, key
 
 
