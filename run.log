@@ -8,30 +8,31 @@ T: 2.0
 SEED: 11
 =================
 Training...
-Epoch  1 | LR: 0.0120 | Sigma: 0.0280 | Time: 0.9s
-Epoch  2 | LR: 0.0106 | Sigma: 0.0279 | Time: 0.7s
-Epoch  3 | LR: 0.0093 | Sigma: 0.0279 | Time: 0.7s
-Epoch  4 | LR: 0.0082 | Sigma: 0.0278 | Time: 0.7s
-Epoch  5 | LR: 0.0072 | Sigma: 0.0278 | Time: 0.7s
-Epoch  6 | LR: 0.0063 | Sigma: 0.0277 | Time: 0.7s
-Epoch  7 | LR: 0.0056 | Sigma: 0.0277 | Time: 0.7s
-Epoch  8 | LR: 0.0049 | Sigma: 0.0276 | Time: 0.7s
-Epoch  9 | LR: 0.0043 | Sigma: 0.0276 | Time: 0.7s
-Epoch 10 | LR: 0.0038 | Sigma: 0.0275 | Time: 0.7s
+Epoch  1 | LR: 0.0120 | Sigma: 0.0280 | Time: 0.7s
+Epoch  2 | LR: 0.0106 | Sigma: 0.0279 | Time: 0.4s
+Epoch  3 | LR: 0.0093 | Sigma: 0.0279 | Time: 0.4s
+Epoch  4 | LR: 0.0082 | Sigma: 0.0278 | Time: 0.4s
+Epoch  5 | LR: 0.0072 | Sigma: 0.0278 | Time: 0.4s
+Epoch  6 | LR: 0.0063 | Sigma: 0.0277 | Time: 0.4s
+Epoch  7 | LR: 0.0056 | Sigma: 0.0277 | Time: 0.4s
+Epoch  8 | LR: 0.0049 | Sigma: 0.0276 | Time: 0.4s
+Epoch  9 | LR: 0.0043 | Sigma: 0.0276 | Time: 0.4s
+Epoch 10 | LR: 0.0038 | Sigma: 0.0275 | Time: 0.4s
 
 Evaluating on test set...
 
 Test Accuracy: 97.30% (9730/10000)
-Training Time: 7.32s
+Training Time: 4.52s
 Peak GPU Memory: 390.3 MB
 === RESULTS ===
 test_accuracy: 0.973000
-training_time_s: 7.32
+training_time_s: 4.52
 peak_memory_mb: 390.3
 ===============
 
 ==================================================
   accuracy : 0.9730  (baseline 0.9764)
-  time     : 7.3s  (9.08x speedup,  target ≤5.0s)
+  time     : 4.5s  (14.71x speedup,  target ≤5.0s)
   memory   : 390MB  (baseline 433MB)
 ==================================================
+TARGET REACHED: 4.5s ≤ 5.0s
