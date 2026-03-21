@@ -55,22 +55,27 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
     """Process an entire epoch in a single JIT call using nested scan."""
     n_batches = X_batched.shape[0]
 
-    # Pre-split all random keys for the epoch (avoids key splitting inside scan)
-    all_keys = jax.random.split(key, n_batches * 6 + 1)
+    # Pre-split one key per batch (avoids key splitting inside scan)
+    all_keys = jax.random.split(key, n_batches + 1)
     key = all_keys[0]
-    vec_keys = all_keys[1:].reshape(n_batches, 6, -1)
+    vec_keys = all_keys[1:]  # (n_batches, 2) — one key per batch
+
+    # Offsets for slicing the single random matrix into 6 vectors
+    # B1(784) + A1(128) + B2(128) + A2(128) + B3(128) + A3(10) = 1306
+    VEC_DIM = 784 + HIDDEN_DIM * 4 + 10
 
     def batch_step(carry, batch_data):
         w1, w2, w3 = carry
-        xb, yb, batch_keys = batch_data  # xb is already bf16
+        xb, yb, batch_key = batch_data  # xb is already bf16
 
-        # Generate all perturbation vectors in bf16 (saves memory + eliminates conversions)
-        A1 = jax.random.normal(batch_keys[0], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.bfloat16)
-        B1 = jax.random.normal(batch_keys[1], (HALF_POPULATION, 784), dtype=jnp.bfloat16)
-        A2 = jax.random.normal(batch_keys[2], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.bfloat16)
-        B2 = jax.random.normal(batch_keys[3], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.bfloat16)
-        A3 = jax.random.normal(batch_keys[4], (HALF_POPULATION, 10), dtype=jnp.bfloat16)
-        B3 = jax.random.normal(batch_keys[5], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.bfloat16)
+        # Single PRNG call for all perturbation vectors
+        all_vecs = jax.random.normal(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.bfloat16)
+        B1 = all_vecs[:, :784]
+        A1 = all_vecs[:, 784:784+HIDDEN_DIM]
+        B2 = all_vecs[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
+        A2 = all_vecs[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM]
+        B3 = all_vecs[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
+        A3 = all_vecs[:, 784+4*HIDDEN_DIM:]
 
         w1_f = w1.astype(jnp.bfloat16)
         w2_f = w2.astype(jnp.bfloat16)
