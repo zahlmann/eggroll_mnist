@@ -49,12 +49,13 @@ CHUNK = 500  # process perturbations in chunks to keep intermediates in L2 cache
 N_CHUNKS = HALF_POPULATION // CHUNK
 
 
-def data_loader(X, y, batch_size, key, shuffle=True):
+def data_loader(X, y, batch_size, key, shuffle=True, drop_last=False):
     n = X.shape[0]
     if shuffle:
         perm = jax.random.permutation(key, n)
         X, y = X[perm], y[perm]
-    for i in range(0, n, batch_size):
+    end = (n // batch_size) * batch_size if drop_last else n
+    for i in range(0, end, batch_size):
         yield X[i:i+batch_size], y[i:i+batch_size]
 
 
@@ -215,7 +216,7 @@ def main():
         epoch_start = time.perf_counter()
         key, data_key = jax.random.split(key)
 
-        for xb, yb in data_loader(X_train, y_train, BATCH_SIZE, data_key):
+        for xb, yb in data_loader(X_train, y_train, BATCH_SIZE, data_key, drop_last=True):
             key, vec_key = jax.random.split(key)
             A1, B1, A2, B2, A3, B3 = generate_half_vectors(
                 vec_key, HALF_POPULATION, 784, HIDDEN_DIM, 10

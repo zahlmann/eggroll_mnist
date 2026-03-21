@@ -1,4 +1,5 @@
 Running benchmark (seed=11)...
+CRASHED
 === CONSTANTS ===
 HIDDEN_DIM: 128
 BATCH_SIZE: 128
@@ -8,30 +9,16 @@ T: 2.0
 SEED: 11
 =================
 Training...
-Epoch  1 | Acc: 85.97% | LR: 0.0120 | Sigma: 0.0280 | Time: 14.3s
-Epoch  2 | Acc: 93.66% | LR: 0.0106 | Sigma: 0.0279 | Time: 6.4s
-Epoch  3 | Acc: 95.40% | LR: 0.0093 | Sigma: 0.0279 | Time: 6.5s
-Epoch  4 | Acc: 96.29% | LR: 0.0082 | Sigma: 0.0278 | Time: 6.5s
-Epoch  5 | Acc: 96.83% | LR: 0.0072 | Sigma: 0.0278 | Time: 6.4s
-Epoch  6 | Acc: 97.23% | LR: 0.0063 | Sigma: 0.0277 | Time: 6.5s
-Epoch  7 | Acc: 97.54% | LR: 0.0056 | Sigma: 0.0277 | Time: 6.4s
-Epoch  8 | Acc: 97.78% | LR: 0.0049 | Sigma: 0.0276 | Time: 6.4s
-Epoch  9 | Acc: 97.96% | LR: 0.0043 | Sigma: 0.0276 | Time: 6.4s
-Epoch 10 | Acc: 98.11% | LR: 0.0038 | Sigma: 0.0275 | Time: 6.5s
 
-Evaluating on test set...
+s/jax/_src/numpy/array_methods.py", line 1152, in meth
+    return getattr(self.aval, name).fun(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/johann/Dropbox/ML/experiments/eggroll_mnist/.venv/lib/python3.12/site-packages/jax/_src/numpy/array_methods.py", line 316, in _reshape
+    newshape = _compute_newshape(self, args[0] if len(args) == 1 else args)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/johann/Dropbox/ML/experiments/eggroll_mnist/.venv/lib/python3.12/site-packages/jax/_src/numpy/array_methods.py", line 481, in _compute_newshape
+    raise TypeError(f"cannot reshape array of shape {arr.shape} (size {arr.size}) "
+TypeError: cannot reshape array of shape (5000, 96) (size 480000) into shape (10, 500, 128) (size 640000)
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 
-Test Accuracy: 97.64% (9764/10000)
-Training Time: 72.31s
-Peak GPU Memory: 433.0 MB
-=== RESULTS ===
-test_accuracy: 0.976400
-training_time_s: 72.31
-peak_memory_mb: 433.0
-===============
-
-==================================================
-  accuracy : 0.9764  (baseline 0.9764)
-  time     : 72.3s  (0.92x speedup,  target ≤5.0s)
-  memory   : 433MB  (baseline 433MB)
-==================================================
