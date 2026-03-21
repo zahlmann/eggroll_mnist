@@ -50,7 +50,7 @@ N_CHUNKS = HALF_POPULATION // CHUNK
 N_BATCHES = (X_train.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(3, 4))
 def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
     """Process an entire epoch in a single JIT call using nested scan."""
     n_batches = X_batched.shape[0]
