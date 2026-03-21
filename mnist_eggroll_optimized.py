@@ -60,30 +60,35 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
 
         key, vec_key = jax.random.split(key)
         keys = jax.random.split(vec_key, 6)
-        # Generate directly in bf16 to save memory traffic
-        A1 = jax.random.normal(keys[0], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.bfloat16)
-        B1 = jax.random.normal(keys[1], (HALF_POPULATION, 784), dtype=jnp.bfloat16)
-        A2 = jax.random.normal(keys[2], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.bfloat16)
-        B2 = jax.random.normal(keys[3], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.bfloat16)
-        A3 = jax.random.normal(keys[4], (HALF_POPULATION, 10), dtype=jnp.bfloat16)
-        B3 = jax.random.normal(keys[5], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.bfloat16)
+        A1 = jax.random.normal(keys[0], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
+        B1 = jax.random.normal(keys[1], (HALF_POPULATION, 784), dtype=jnp.float32)
+        A2 = jax.random.normal(keys[2], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
+        B2 = jax.random.normal(keys[3], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
+        A3 = jax.random.normal(keys[4], (HALF_POPULATION, 10), dtype=jnp.float32)
+        B3 = jax.random.normal(keys[5], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
 
         w1_f = w1.astype(jnp.bfloat16)
         w2_f = w2.astype(jnp.bfloat16)
         w3_f = w3.astype(jnp.bfloat16)
         sigma_f = jnp.bfloat16(sigma)
+        A1_f = A1.astype(jnp.bfloat16)
+        B1_f = B1.astype(jnp.bfloat16)
+        A2_f = A2.astype(jnp.bfloat16)
+        B2_f = B2.astype(jnp.bfloat16)
+        A3_f = A3.astype(jnp.bfloat16)
+        B3_f = B3.astype(jnp.bfloat16)
 
         base1 = xb @ w1_f
-        xB1_T = B1 @ xb.T
+        xB1_T = B1_f @ xb.T
         y_one_hot = jax.nn.one_hot(yb, 10)
 
         # Reshape for scan over chunks
-        A1_c = A1.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
+        A1_c = A1_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
         xB1_T_c = xB1_T.reshape(N_CHUNKS, CHUNK, BATCH_SIZE)
-        A2_c = A2.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
-        B2_c = B2.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
-        A3_c = A3.reshape(N_CHUNKS, CHUNK, 10)
-        B3_c = B3.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
+        A2_c = A2_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
+        B2_c = B2_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
+        A3_c = A3_f.reshape(N_CHUNKS, CHUNK, 10)
+        B3_c = B3_f.reshape(N_CHUNKS, CHUNK, HIDDEN_DIM)
 
         def chunk_forward(carry, chunk_data):
             base1, w2_f, w3_f, sigma_f, y_one_hot = carry
@@ -134,10 +139,9 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         scale = 1.0 / (2 * sigma * HALF_POPULATION)
         shaped_col = shaped[:, None]
 
-        # Cast bf16 perturbation vectors to fp32 for gradient precision
-        grad1 = scale * (B1.astype(jnp.float32) * shaped_col).T @ A1.astype(jnp.float32)
-        grad2 = scale * (B2.astype(jnp.float32) * shaped_col).T @ A2.astype(jnp.float32)
-        grad3 = scale * (B3.astype(jnp.float32) * shaped_col).T @ A3.astype(jnp.float32)
+        grad1 = scale * (B1 * shaped_col).T @ A1
+        grad2 = scale * (B2 * shaped_col).T @ A2
+        grad3 = scale * (B3 * shaped_col).T @ A3
 
         w1 = w1 + lr * grad1
         w2 = w2 + lr * grad2
