@@ -8,12 +8,12 @@ Same architecture (784-128-128-10 MLP, GELU, 10 epochs), same GPU (RTX 4080 SUPE
 
 | | Backprop | EGGROLL |
 |---|---|---|
-| **Training time** | 4.7s | 7.2s |
-| **Steady-state (per epoch)** | 0.2s | **0.4s** |
-| **Test accuracy** | 97.3% | 97.4% |
+| **Training time** | 4.7s | 6.5s |
+| **Steady-state (per epoch)** | 0.2s | **0.36s** |
+| **Test accuracy** | 97.3% | 97.5% |
 | **Peak memory** | 391 MB | 390 MB |
 
-EGGROLL does **1,111x more FLOPs** than backprop (10,000 forward passes per batch vs 1 forward + 1 backward). Both times include JIT compilation on epoch 1 (~3s each). At steady state, EGGROLL is only **2x slower per epoch** despite the 1000x compute gap, thanks to a fused Triton kernel that saturates tensor cores.
+EGGROLL does **1,111x more FLOPs** than backprop (10,000 forward passes per batch vs 1 forward + 1 backward). Both times include JIT compilation on epoch 1 (~3s each). At steady state, EGGROLL is only **1.8x slower per epoch** despite the 1000x compute gap, thanks to a fused Triton kernel with FP8 tensor cores.
 
 ### How to run
 
@@ -27,34 +27,39 @@ Requires `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/
 
 ### What made it fast
 
-The optimization went from **27s to 7.2s** (3.8x speedup). Three things mattered:
+The optimization went from **27s to 6.5s** (4.2x speedup). Four things mattered:
 
 **1. Fused 3-layer Triton kernel** (10.7s -> 7.2s, steady-state 1.0s -> 0.4s/epoch)
 
 The bottleneck was memory bandwidth: intermediate activations (`l1`, `l2`, logits) were written to HBM then re-read multiple times per forward pass. A custom Triton kernel fuses all three layers + cross-entropy fitness into a single GPU kernel where intermediates stay in registers. This eliminates ~95% of HBM traffic.
 
-Key design decisions that made the kernel work (previous attempts failed):
-- **BLOCK_B=64**: the (64, 128) x (128, 128) matmul tile is the sweet spot for tensor core utilization. BLOCK_B=16 was 3x slower (bad utilization), BLOCK_B=128 was 1.4x slower (register spilling).
-- **One direction per kernel call**: processes positive OR negative perturbation, not both simultaneously. Halves peak register pressure.
-- **Fast GELU**: `x * sigmoid(1.702x)` instead of `x * (1 + erf(x/sqrt(2)))/2`. Simpler for the compiler.
+**2. K-tiled L1→L2 matmul + FP8 tensor cores** (7.2s -> 6.5s, steady-state 0.4s -> 0.36s/epoch)
+
+The original kernel loaded full `l1` (64x128) and `w2` (128x128) simultaneously, causing high register pressure (~192 regs/thread, only 25% occupancy). The K-tiled approach computes `l1` in (64, 32) tiles within a K-loop, feeding each tile directly into the L2 matmul accumulation. Only 32 columns of `l1` are live at any time, halving register pressure (~113 regs/thread, 4 blocks/SM).
+
+Additionally, using FP8 E4M3 (`tl.float8e4nv`) for the L2 and L3 matmul operands gives 2x tensor core throughput on Ada Lovelace with no accuracy loss for the ES fitness signal.
 
 See `kernels/fused_3layer_ce.py`.
 
-**2. Pre-split PRNG keys** (27s -> 10.7s)
+**3. Pre-split PRNG keys** (27s -> 10.7s)
 
 `jax.random.split(key)` inside a `jax.lax.scan` loop creates a sequential dependency between batches (each batch's key depends on the previous). Pre-generating all 468 keys before the scan breaks this chain, letting XLA pipeline batch computations.
 
-**3. Epoch-level scan + AOT compilation** (saves ~3s)
+**4. Epoch-level scan** (saves ~3s)
 
-Wrapping all 468 batches in `jax.lax.scan` eliminates Python loop overhead. AOT-compiling the function before timing removes JIT cost.
+Wrapping all 468 batches in `jax.lax.scan` eliminates Python loop overhead and lets XLA compile the entire epoch as one GPU program.
 
 ### What didn't work
 
-- **Triton with BLOCK_B=16**: register pressure caused low occupancy, slower than cuBLAS
-- **Unrolling the inner scan**: XLA can't reuse buffers across unrolled iterations
-- **Merging pos/neg directions in one kernel call**: doubles registers, kills performance
-- **Large population chunks (>500)**: intermediates overflow L2 cache
+- **BLOCK_B=16 or 128**: bad tensor core utilization (16) or register spilling (128)
+- **BLOCK_K=64, num_stages=4**: higher register pressure hurts occupancy
+- **Doubly-tiled J+K kernel**: recomputing GELU 4x per J-tile costs more than the occupancy gain
+- **Merging pos/neg directions in one kernel call**: sign loop doubles block time without improving concurrency
+- **Pure JAX (no Triton)**: 2.5x slower per-epoch; the fused kernel's HBM savings are essential
+- **Per-batch JIT (no scan)**: scan gives better XLA optimization than a Python loop
+- **bf16 gradient matmuls**: saves 0.06s/epoch compute but adds 0.5s to JIT compilation
 - **unsafe_rbg PRNG**: accuracy dropped below threshold
+- **Compilation caching**: unfair (equivalent to AOT warmup across runs)
 
 ### Agent-driven optimization
 
