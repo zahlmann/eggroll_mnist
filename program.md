@@ -65,6 +65,24 @@ Also forbidden:
 - Modifying `validate.py` or `benchmark.py`
 - Installing packages not already in `pyproject.toml` (you may add triton/jax-triton)
 
+## Fairness Rules (catch yourself on these)
+
+Optimizations must be **honestly comparable** to the backprop baseline. Watch for:
+
+1. **JIT/compilation hiding**: don't exclude JIT compilation time from the measured
+   `training_time_s` (e.g., via AOT compilation or warmup before `start_time`).
+   Both backprop and EGGROLL include first-epoch JIT in their timing.
+2. **Activation mismatch**: if you change the activation in the training forward pass
+   (e.g., fast GELU approximation), you MUST use the same activation in
+   `evaluate_batch()`. Otherwise test accuracy measures a different network.
+3. **Memory measurement**: `get_gpu_memory_mb()` should report actual usage,
+   not just post-epoch snapshots that miss transient peaks. If you change the
+   memory function, verify it catches in-kernel allocations.
+4. **Precision asymmetry**: both scripts must use fp32 training data. Using bf16
+   data for EGGROLL but fp32 for backprop is not a fair comparison.
+5. **Data subsetting**: don't silently drop training samples to reduce batch count.
+   Both scripts should process the same amount of data per epoch.
+
 ---
 
 ## The Algorithm (what you're optimizing)

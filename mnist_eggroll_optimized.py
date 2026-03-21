@@ -137,8 +137,8 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
 
 @jax.jit
 def evaluate_batch(w1, w2, w3, xb, yb):
-    l1 = jax.nn.gelu(xb @ w1)
-    l2 = jax.nn.gelu(l1 @ w2)
+    l1 = fast_gelu(xb @ w1)
+    l2 = fast_gelu(l1 @ w2)
     logits = l2 @ w3
     preds = jnp.argmax(logits, axis=1)
     return jnp.mean(preds == yb)
@@ -168,16 +168,6 @@ def main():
     w2 = initializer(k2, (HIDDEN_DIM, HIDDEN_DIM), jnp.float32)
     w3 = initializer(k3, (HIDDEN_DIM, 10), jnp.float32)
 
-    # AOT compile train_epoch (not counted in training time)
-    key, warmup_key, warmup_data_key = jax.random.split(key, 3)
-    perm = jax.random.permutation(warmup_data_key, X_train.shape[0])
-    X_warm = X_train[perm][:N_BATCHES * BATCH_SIZE].reshape(N_BATCHES, BATCH_SIZE, -1)
-    y_warm = y_train[perm][:N_BATCHES * BATCH_SIZE].reshape(N_BATCHES, BATCH_SIZE)
-    train_epoch_compiled = jax.jit(train_epoch).lower(
-        w1, w2, w3, X_warm, y_warm, SIGMA_START, LR_START, warmup_key
-    ).compile()
-    del X_warm, y_warm
-
     print("Training...")
     start_time = time.perf_counter()
 
@@ -194,7 +184,7 @@ def main():
         X_shuf = X_train[perm][:N_BATCHES * BATCH_SIZE].reshape(N_BATCHES, BATCH_SIZE, -1)
         y_shuf = y_train[perm][:N_BATCHES * BATCH_SIZE].reshape(N_BATCHES, BATCH_SIZE)
 
-        w1, w2, w3, key = train_epoch_compiled(w1, w2, w3, X_shuf, y_shuf, sigma, lr, key)
+        w1, w2, w3, key = train_epoch(w1, w2, w3, X_shuf, y_shuf, sigma, lr, key)
 
         # Wait for computation to complete before timing
         jax.block_until_ready(w1)

@@ -1,6 +1,6 @@
 ## EGGROLL MNIST
 
-Evolution Strategies training that **matches backprop speed** on a 3-layer MLP, using custom Triton GPU kernels.
+Evolution Strategies training that **nearly matches backprop speed** on a 3-layer MLP, using custom Triton GPU kernels.
 
 ### Results
 
@@ -8,11 +8,12 @@ Same architecture (784-128-128-10 MLP, GELU, 10 epochs), same GPU (RTX 4080 SUPE
 
 | | Backprop | EGGROLL |
 |---|---|---|
-| **Training time** | 4.7s | **4.5s** |
-| **Test accuracy** | 97.3% | 97.3% |
+| **Training time** | 4.7s | 7.2s |
+| **Steady-state (per epoch)** | 0.2s | **0.4s** |
+| **Test accuracy** | 97.3% | 97.4% |
 | **Peak memory** | 391 MB | 390 MB |
 
-EGGROLL does **1,111x more FLOPs** than backprop (10,000 forward passes per batch vs 1 forward + 1 backward). It matches wall-clock time by saturating tensor cores through a fused Triton kernel.
+EGGROLL does **1,111x more FLOPs** than backprop (10,000 forward passes per batch vs 1 forward + 1 backward). Both times include JIT compilation on epoch 1 (~3s each). At steady state, EGGROLL is only **2x slower per epoch** despite the 1000x compute gap, thanks to a fused Triton kernel that saturates tensor cores.
 
 ### How to run
 
@@ -26,9 +27,9 @@ Requires `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/
 
 ### What made it fast
 
-The optimization went from **27s to 4.5s** (6x speedup). Three things mattered:
+The optimization went from **27s to 7.2s** (3.8x speedup). Three things mattered:
 
-**1. Fused 3-layer Triton kernel** (10.3s -> 4.5s)
+**1. Fused 3-layer Triton kernel** (10.7s -> 7.2s, steady-state 1.0s -> 0.4s/epoch)
 
 The bottleneck was memory bandwidth: intermediate activations (`l1`, `l2`, logits) were written to HBM then re-read multiple times per forward pass. A custom Triton kernel fuses all three layers + cross-entropy fitness into a single GPU kernel where intermediates stay in registers. This eliminates ~95% of HBM traffic.
 
