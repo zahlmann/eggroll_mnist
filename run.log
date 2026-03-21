@@ -1,5 +1,4 @@
 Running benchmark (seed=11)...
-CRASHED
 === CONSTANTS ===
 HIDDEN_DIM: 128
 BATCH_SIZE: 128
@@ -9,16 +8,30 @@ T: 2.0
 SEED: 11
 =================
 Training...
+Epoch  1 | LR: 0.0120 | Sigma: 0.0280 | Time: 7.9s
+Epoch  2 | LR: 0.0106 | Sigma: 0.0279 | Time: 3.2s
+Epoch  3 | LR: 0.0093 | Sigma: 0.0279 | Time: 3.2s
+Epoch  4 | LR: 0.0082 | Sigma: 0.0278 | Time: 3.2s
+Epoch  5 | LR: 0.0072 | Sigma: 0.0278 | Time: 3.2s
+Epoch  6 | LR: 0.0063 | Sigma: 0.0277 | Time: 3.2s
+Epoch  7 | LR: 0.0056 | Sigma: 0.0277 | Time: 3.2s
+Epoch  8 | LR: 0.0049 | Sigma: 0.0276 | Time: 3.2s
+Epoch  9 | LR: 0.0043 | Sigma: 0.0276 | Time: 3.2s
+Epoch 10 | LR: 0.0038 | Sigma: 0.0275 | Time: 3.2s
 
-s/jax/_src/numpy/array_methods.py", line 1152, in meth
-    return getattr(self.aval, name).fun(self, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/johann/Dropbox/ML/experiments/eggroll_mnist/.venv/lib/python3.12/site-packages/jax/_src/numpy/array_methods.py", line 316, in _reshape
-    newshape = _compute_newshape(self, args[0] if len(args) == 1 else args)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/johann/Dropbox/ML/experiments/eggroll_mnist/.venv/lib/python3.12/site-packages/jax/_src/numpy/array_methods.py", line 481, in _compute_newshape
-    raise TypeError(f"cannot reshape array of shape {arr.shape} (size {arr.size}) "
-TypeError: cannot reshape array of shape (5000, 96) (size 480000) into shape (10, 500, 128) (size 640000)
---------------------
-For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+Evaluating on test set...
 
+Test Accuracy: 97.70% (9770/10000)
+Training Time: 36.87s
+Peak GPU Memory: 434.0 MB
+=== RESULTS ===
+test_accuracy: 0.977000
+training_time_s: 36.87
+peak_memory_mb: 434.0
+===============
+
+==================================================
+  accuracy : 0.9770  (baseline 0.9764)
+  time     : 36.9s  (1.80x speedup,  target ≤5.0s)
+  memory   : 434MB  (baseline 433MB)
+==================================================

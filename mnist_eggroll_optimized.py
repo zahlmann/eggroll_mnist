@@ -45,7 +45,7 @@ LR_DECAY = 0.88
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
-CHUNK = 500  # process perturbations in chunks to keep intermediates in L2 cache
+CHUNK = 1000  # process perturbations in chunks to keep intermediates in L2 cache
 N_CHUNKS = HALF_POPULATION // CHUNK
 
 
