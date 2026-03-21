@@ -7,6 +7,7 @@ dcd5054	0.975800	64.19	433.0	discard	num_warps=2 num_stages=2 made kernel slower
 7822728	0.977000	27.78	390.4	keep	epoch-level scan: entire epoch in single JIT call
 2b5e4c6	0.975100	23.39	210.9	keep	JIT warmup + bf16 training data; 2.84x speedup
 19287f6	0.973400	10.67	210.9	keep	pre-split keys removes data dependency; 6.23x speedup; 1.1s/epoch
+5dbcf65	0.974300	10.61	210.9	keep	all bf16 vectors + restructured gradient; validated avg 97.45%
 2026-03-21T21:31:48.301058	8514bf3	11	0.9734	10.66	210.9	keep	acc=0.9739 time=10.7s mem=211MB
 2026-03-21T21:31:48.301257	8514bf3	42	0.974	10.68	210.9	keep	acc=0.9739 time=10.7s mem=211MB
 2026-03-21T21:31:48.301293	8514bf3	7	0.9742	10.76	210.9	keep	acc=0.9739 time=10.7s mem=211MB
