@@ -193,17 +193,80 @@ multi-output kernels. Critical: argument order to triton_call is
 
 ---
 
-## Reference Numbers
+## Precision Rules
 
-| Implementation | Time   | Memory | Accuracy |
-|---------------|--------|--------|----------|
-| Backprop      | ~4.5s  | ~391MB | ~97.5%   |
-| EGGROLL JAX   | ~66s   | ~433MB | ~97.6%   |
-| Your target   | ≤10s   | ≤500MB | ≥97.2%   |
+Both EGGROLL and backprop must use **fp32 data** for a fair comparison. The forward
+pass may use bf16 matmuls internally (JAX does this automatically via tensor cores),
+but training data (`X_train`) and perturbation vectors must be generated in fp32.
+No bf16 data loading tricks — the comparison must be apples-to-apples.
 
-Note: The README cites ~27s but that was measured without competing GPU load. There
-is another process using ~6GB VRAM, leaving ~4GB free. EGGROLL only needs ~433MB so
-there is no VRAM pressure, but GPU compute is shared. Always run `benchmark.py` first
-at the start of a session to get the current baseline — it may vary.
+## Reference Numbers (uncontended GPU, RTX 4080 SUPER)
 
-Each run uses ~433MB peak — there is plenty of headroom for kernel experiments.
+| Implementation     | Time    | Memory | Accuracy |
+|--------------------|---------|--------|----------|
+| Backprop (fp32)    | ~4.7s   | ~391MB | ~97.3%   |
+| EGGROLL baseline   | ~27.3s  | ~390MB | ~97.6%   |
+| EGGROLL optimized  | ~10.7s  | ~390MB | ~97.3%   |
+| Your target        | ≤5s     | ≤500MB | ≥97.2%   |
+
+Current speedup: 2.6x over baseline, 2.3x gap to backprop.
+The 2.3x gap is algorithmic — EGGROLL evaluates 10,000 forward passes per batch
+vs backprop's 1 forward + 1 backward. Closing it further requires reducing the
+work per forward pass or increasing hardware utilization.
+
+Always run `benchmark.py` at the start of a session to get the current baseline.
+Check `nvidia-smi` — if another process is using the GPU, numbers will be inflated.
+
+## What worked so far (session 2025-03-21)
+
+1. **Pre-split random keys** (2.6x of the total speedup): generating all PRNG keys
+   before the batch scan breaks the sequential dependency chain, letting XLA pipeline
+   batch computations. This was the single biggest win.
+2. **Epoch-level scan**: wrapping all 468 batches in `jax.lax.scan` eliminates Python
+   loop overhead and lets XLA compile the entire epoch as one program.
+3. **AOT compilation**: `jax.jit(...).lower(...).compile()` before timing removes
+   JIT overhead from the measured training time.
+4. **Chunked inner scan** (CHUNK=500): processing perturbations in chunks of 500
+   keeps intermediates in L2 cache. Larger chunks overflow L2 and are slower.
+5. **Single PRNG call**: generating one (5000, 1306) random matrix and slicing
+   reduces kernel launch overhead vs 6 separate calls.
+
+## What did NOT work
+
+- **Triton kernels** (fused L1+L2, persistent fwd+fitness): register pressure caused
+  low occupancy, making them slower than cuBLAS + XLA fusion. The small tile sizes
+  (16×128) don't utilize tensor cores efficiently.
+- **Unrolling the inner scan**: XLA can't reuse buffers across unrolled iterations,
+  causing 2x slowdown.
+- **Merging pos/neg directions**: concatenation overhead + reduced parallelism made
+  it slower than separate pos/neg computation.
+- **unsafe_rbg PRNG**: lower randomness quality dropped accuracy below threshold.
+- **CHUNK>500**: L2 cache overflow. CHUNK=1000 → 1.6s/epoch, CHUNK=2500 → 4.1s/epoch.
+
+## Ideas to try next
+
+### High potential
+1. **Custom CUDA kernel via pallas or raw CUDA**: bypass Triton's register allocator.
+   Pallas (JAX's kernel language) might give better control than jax-triton.
+2. **Fuse random generation + forward pass**: generate perturbation vectors on-the-fly
+   inside the forward kernel instead of materializing them to HBM first.
+3. **Reduce inner scan iterations**: find a way to process larger chunks without
+   L2 overflow — e.g., tile the HIDDEN dimension to reduce per-chunk memory.
+4. **Operator fusion via custom_vjp/custom_jvp**: manually fuse the xB dot product
+   with the subsequent matmul to eliminate one read of l1/l2.
+
+### Medium potential
+5. **Async data shuffling**: overlap epoch data preparation with previous epoch's compute.
+6. **Reduce gradient matmul cost**: the (784, 5000) @ (5000, 128) matmul for grad1
+   is memory-bound. Could accumulate gradients inside the inner scan to avoid
+   materializing all 5000 fitness values.
+7. **Mixed scan/vmap**: use vmap within chunks for the element-wise ops and explicit
+   matmul for the shared-weight operations.
+
+### Speculative
+8. **FP8 tensor cores**: RTX 4080 supports FP8 — 2x throughput over bf16. Need to
+   check JAX/XLA support.
+9. **Process multiple batches per scan step**: concatenate 2-4 batches and process
+   together to amortize overhead. Requires static batch count.
+10. **Gradient accumulation inside inner scan**: instead of outputting fitness and
+    computing gradient separately, accumulate (B * fitness_diff) @ A incrementally.

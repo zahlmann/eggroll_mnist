@@ -27,7 +27,7 @@ if not os.path.exists("mnist_prepped_float.npz"):
     exit(1)
 
 data = np.load("mnist_prepped_float.npz")
-X_train = jnp.array(data["X_train"]).astype(jnp.bfloat16)  # pre-convert to bf16
+X_train = jnp.array(data["X_train"])
 y_train = jnp.array(data["y_train"])
 X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
@@ -66,10 +66,10 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
 
     def batch_step(carry, batch_data):
         w1, w2, w3 = carry
-        xb, yb, batch_key = batch_data  # xb is already bf16
+        xb, yb, batch_key = batch_data
 
-        # Single PRNG call for all perturbation vectors
-        all_vecs = jax.random.normal(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.bfloat16)
+        # Generate perturbation vectors in fp32
+        all_vecs = jax.random.normal(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32)
         B1 = all_vecs[:, :784]
         A1 = all_vecs[:, 784:784+HIDDEN_DIM]
         B2 = all_vecs[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
@@ -77,19 +77,21 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         B3 = all_vecs[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
         A3 = all_vecs[:, 784+4*HIDDEN_DIM:]
 
+        # Convert to bf16 for forward pass matmuls
+        xb_f = xb.astype(jnp.bfloat16)
         w1_f = w1.astype(jnp.bfloat16)
         w2_f = w2.astype(jnp.bfloat16)
         w3_f = w3.astype(jnp.bfloat16)
         sigma_f = jnp.bfloat16(sigma)
-        A1_f = A1  # already bf16
-        B1_f = B1
-        A2_f = A2
-        B2_f = B2
-        A3_f = A3
-        B3_f = B3
+        A1_f = A1.astype(jnp.bfloat16)
+        B1_f = B1.astype(jnp.bfloat16)
+        A2_f = A2.astype(jnp.bfloat16)
+        B2_f = B2.astype(jnp.bfloat16)
+        A3_f = A3.astype(jnp.bfloat16)
+        B3_f = B3.astype(jnp.bfloat16)
 
-        base1 = xb @ w1_f
-        xB1_T = B1_f @ xb.T
+        base1 = xb_f @ w1_f
+        xB1_T = B1_f @ xb_f.T
         y_one_hot = jax.nn.one_hot(yb, 10)
 
         # Reshape for scan over chunks
@@ -146,10 +148,9 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         scale = 1.0 / (2 * sigma * HALF_POPULATION)
         shaped_col = shaped[:, None]
 
-        # Restructure gradient: B.T @ (shaped * A) avoids large (5000, 784) intermediate
-        grad1 = scale * B1.astype(jnp.float32).T @ (shaped_col * A1.astype(jnp.float32))
-        grad2 = scale * B2.astype(jnp.float32).T @ (shaped_col * A2.astype(jnp.float32))
-        grad3 = scale * B3.astype(jnp.float32).T @ (shaped_col * A3.astype(jnp.float32))
+        grad1 = scale * B1.T @ (shaped_col * A1)
+        grad2 = scale * B2.T @ (shaped_col * A2)
+        grad3 = scale * B3.T @ (shaped_col * A3)
 
         w1 = w1 + lr * grad1
         w2 = w2 + lr * grad2
