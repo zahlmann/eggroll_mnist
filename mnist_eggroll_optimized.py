@@ -64,8 +64,10 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         w1, w2, w3 = carry
         xb, yb, batch_keys = batch_data  # xb is already bf16
 
+        # Generate B1 directly in bf16 (largest vector, saves 50% memory traffic)
+        # Keep A1/A2/B2/B3 in fp32 for gradient precision
         A1 = jax.random.normal(batch_keys[0], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
-        B1 = jax.random.normal(batch_keys[1], (HALF_POPULATION, 784), dtype=jnp.float32)
+        B1 = jax.random.normal(batch_keys[1], (HALF_POPULATION, 784), dtype=jnp.bfloat16)
         A2 = jax.random.normal(batch_keys[2], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
         B2 = jax.random.normal(batch_keys[3], (HALF_POPULATION, HIDDEN_DIM), dtype=jnp.float32)
         A3 = jax.random.normal(batch_keys[4], (HALF_POPULATION, 10), dtype=jnp.float32)
@@ -76,7 +78,7 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         w3_f = w3.astype(jnp.bfloat16)
         sigma_f = jnp.bfloat16(sigma)
         A1_f = A1.astype(jnp.bfloat16)
-        B1_f = B1.astype(jnp.bfloat16)
+        B1_f = B1  # already bf16
         A2_f = A2.astype(jnp.bfloat16)
         B2_f = B2.astype(jnp.bfloat16)
         A3_f = A3.astype(jnp.bfloat16)
@@ -143,7 +145,7 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         scale = 1.0 / (2 * sigma * HALF_POPULATION)
         shaped_col = shaped[:, None]
 
-        grad1 = scale * (B1 * shaped_col).T @ A1
+        grad1 = scale * (B1.astype(jnp.float32) * shaped_col).T @ A1
         grad2 = scale * (B2 * shaped_col).T @ A2
         grad3 = scale * (B3 * shaped_col).T @ A3
 
