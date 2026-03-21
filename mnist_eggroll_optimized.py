@@ -4,7 +4,6 @@ import time
 import argparse
 import numpy as np
 import jax
-jax.config.update("jax_default_prng_impl", "unsafe_rbg")
 import jax.numpy as jnp
 from functools import partial
 

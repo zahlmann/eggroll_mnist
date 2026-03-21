@@ -21,17 +21,18 @@ Epoch 10 | LR: 0.0038 | Sigma: 0.0275 | Time: 2.3s
 
 Evaluating on test set...
 
-Test Accuracy: 97.51% (9751/10000)
-Training Time: 23.39s
+Test Accuracy: 97.16% (9716/10000)
+Training Time: 22.96s
 Peak GPU Memory: 210.9 MB
 === RESULTS ===
-test_accuracy: 0.975100
-training_time_s: 23.39
+test_accuracy: 0.971600
+training_time_s: 22.96
 peak_memory_mb: 210.9
 ===============
 
 ==================================================
-  accuracy : 0.9751  (baseline 0.9764)
-  time     : 23.4s  (2.84x speedup,  target ≤5.0s)
+  accuracy : 0.9716  (baseline 0.9764)
+  time     : 23.0s  (2.90x speedup,  target ≤5.0s)
   memory   : 211MB  (baseline 433MB)
 ==================================================
+WARNING: accuracy below 97.2% threshold — validate.py will fail
