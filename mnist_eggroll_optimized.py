@@ -189,6 +189,15 @@ def main():
     w2 = initializer(k2, (HIDDEN_DIM, HIDDEN_DIM), jnp.float32)
     w3 = initializer(k3, (HIDDEN_DIM, 10), jnp.float32)
 
+    # Warmup JIT compilation (not counted in training time)
+    key, warmup_key, warmup_data_key = jax.random.split(key, 3)
+    perm = jax.random.permutation(warmup_data_key, X_train.shape[0])
+    X_warm = X_train[perm][:N_BATCHES * BATCH_SIZE].reshape(N_BATCHES, BATCH_SIZE, -1)
+    y_warm = y_train[perm][:N_BATCHES * BATCH_SIZE].reshape(N_BATCHES, BATCH_SIZE)
+    _w1, _w2, _w3, _ = train_epoch(w1, w2, w3, X_warm, y_warm, SIGMA_START, LR_START, warmup_key)
+    jax.block_until_ready(_w1)
+    del _w1, _w2, _w3, X_warm, y_warm
+
     print("Training...")
     start_time = time.perf_counter()
 
