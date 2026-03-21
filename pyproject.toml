@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "jax[cuda]",
+    "jax-triton",
     "numpy",
+    "triton",
     "xprof>=2.21.5",
 ]
