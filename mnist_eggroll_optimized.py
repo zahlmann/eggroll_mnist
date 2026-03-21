@@ -1,9 +1,12 @@
 import os
+import sys
 import time
+import argparse
 import numpy as np
 import jax
 import jax.numpy as jnp
 from functools import partial
+from kernels.fused_l12 import fused_l12
 
 def get_gpu_memory_mb():
     """Get current GPU memory usage in MB."""
@@ -30,17 +33,18 @@ y_train = jnp.array(data["y_train"])
 X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
-LR_START = 0.012
-LR_DECAY = 0.88
-SIGMA_START = 0.028
-SIGMA_DECAY = 0.998
+# ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
 HALF_POPULATION = 5000
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
+T = 2.0  # temperature for CE fitness (T>1 softens logits → smoother ES gradients)
 
-# Temperature for softmax smoothing in CE fitness (T>1 softens, T=1 is plain CE)
-T = 2.0
+# ---- Tunable hyperparameters (agent may adjust these) ----
+LR_START = 0.012
+LR_DECAY = 0.88
+SIGMA_START = 0.028
+SIGMA_DECAY = 0.998
 
 
 def data_loader(X, y, batch_size, key, shuffle=True):
@@ -88,28 +92,18 @@ def train_step_antithetic(w1, w2, w3, xb, yb,
     B3_f = B3.astype(jnp.bfloat16)
     sigma_f = jnp.bfloat16(sigma)
 
-    # Positive perturbations (+sigma*e)
-    base1 = xb_f @ w1_f
-    xB1 = xb_f @ B1_f.T
-    pert1_pos = xB1.T[:, :, None] * A1_f[:, None, :]
-    l1_pos = jax.nn.gelu(base1[None, :, :] + sigma_f * pert1_pos)
+    # Precompute base1 (shared across all pop members) and xB1_T (contiguous layout)
+    base1 = xb_f @ w1_f                           # (BATCH, HIDDEN)
+    xB1_T = B1_f @ xb_f.T                         # (HALF_POP, BATCH) — contiguous, coalesced reads
+    sigma_f32 = sigma.astype(jnp.float32)
 
-    base2_pos = (l1_pos.reshape(-1, w1_f.shape[1]) @ w2_f).reshape(half_pop, -1, w2_f.shape[1])
-    xB2_pos = jnp.einsum('pbh,ph->pb', l1_pos, B2_f)
-    pert2_pos = xB2_pos[:, :, None] * A2_f[:, None, :]
-    l2_pos = jax.nn.gelu(base2_pos + sigma_f * pert2_pos)
+    # Fused L1+L2 kernel: avoids materialising l1_pos/neg (~960 MB HBM/step)
+    l2_pos, l2_neg = fused_l12(base1, xB1_T, A1_f, w2_f, B2_f, A2_f, sigma_f32)
 
+    # Layer 3 (remains in JAX/cuBLAS — l2 is (HALF_POP, BATCH, HIDDEN))
     base3_pos = (l2_pos.reshape(-1, w2_f.shape[1]) @ w3_f).reshape(half_pop, -1, w3_f.shape[1])
     xB3_pos = jnp.einsum('pbh,ph->pb', l2_pos, B3_f)
     logits_pos = base3_pos + sigma_f * (xB3_pos[:, :, None] * A3_f[:, None, :])
-
-    # Negative perturbations (-sigma*e)
-    l1_neg = jax.nn.gelu(base1[None, :, :] - sigma_f * pert1_pos)
-
-    base2_neg = (l1_neg.reshape(-1, w1_f.shape[1]) @ w2_f).reshape(half_pop, -1, w2_f.shape[1])
-    xB2_neg = jnp.einsum('pbh,ph->pb', l1_neg, B2_f)
-    pert2_neg = xB2_neg[:, :, None] * A2_f[:, None, :]
-    l2_neg = jax.nn.gelu(base2_neg - sigma_f * pert2_neg)
 
     base3_neg = (l2_neg.reshape(-1, w2_f.shape[1]) @ w3_f).reshape(half_pop, -1, w3_f.shape[1])
     xB3_neg = jnp.einsum('pbh,ph->pb', l2_neg, B3_f)
@@ -164,7 +158,21 @@ def evaluate_batch(w1, w2, w3, xb, yb):
 
 
 def main():
-    key = jax.random.PRNGKey(11)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=11)
+    args = parser.parse_args()
+
+    # Print locked constants — validate.py parses this block
+    print("=== CONSTANTS ===")
+    print(f"HIDDEN_DIM: {HIDDEN_DIM}")
+    print(f"BATCH_SIZE: {BATCH_SIZE}")
+    print(f"EPOCHS: {EPOCHS}")
+    print(f"HALF_POPULATION: {HALF_POPULATION}")
+    print(f"T: {T}")
+    print(f"SEED: {args.seed}")
+    print("=================")
+
+    key = jax.random.PRNGKey(args.seed)
 
     # Initialize weights
     key, k1, k2, k3 = jax.random.split(key, 4)
@@ -229,6 +237,13 @@ def main():
     print(f"Test Accuracy: {test_acc:.2%} ({int(test_acc * total)}/{total})")
     print(f"Training Time: {train_time:.2f}s")
     print(f"Peak GPU Memory: {peak_memory:.1f} MB")
+
+    # Machine-parseable results block — validate.py and benchmark.py grep this
+    print("=== RESULTS ===")
+    print(f"test_accuracy: {test_acc:.6f}")
+    print(f"training_time_s: {train_time:.2f}")
+    print(f"peak_memory_mb: {peak_memory:.1f}")
+    print("===============")
 
 
 if __name__ == "__main__":
