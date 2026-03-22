@@ -6,7 +6,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from functools import partial
-from kernels.fused_3layer_ce import fused_3layer_ce_both
+from kernels.pallas_3layer_ce import pallas_3layer_ce_both as fused_3layer_ce_both
 
 
 def fast_gelu(x):
