@@ -152,19 +152,20 @@ def main():
             all_vecs = torch.randn(HALF_POPULATION, VEC_DIM, dtype=torch.float32, device=DEVICE)
             all_vecs_f = all_vecs.to(torch.bfloat16)
 
-            B1_f = all_vecs_f[:, :784]
-            A1_f = all_vecs_f[:, 784:784+HIDDEN_DIM]
-            B2_f = all_vecs_f[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
-            A2_f = all_vecs_f[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM]
-            B3_f = all_vecs_f[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
-            A3_f = all_vecs_f[:, 784+4*HIDDEN_DIM:]
+            # Slices must be contiguous for Triton kernel pointer arithmetic
+            B1_f = all_vecs_f[:, :784].contiguous()
+            A1_f = all_vecs_f[:, 784:784+HIDDEN_DIM].contiguous()
+            B2_f = all_vecs_f[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM].contiguous()
+            A2_f = all_vecs_f[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM].contiguous()
+            B3_f = all_vecs_f[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM].contiguous()
+            A3_f = all_vecs_f[:, 784+4*HIDDEN_DIM:].contiguous()
 
-            B1 = all_vecs[:, :784]
-            A1 = all_vecs[:, 784:784+HIDDEN_DIM]
-            B2 = all_vecs[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
-            A2 = all_vecs[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM]
-            B3 = all_vecs[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
-            A3 = all_vecs[:, 784+4*HIDDEN_DIM:]
+            B1 = all_vecs[:, :784].contiguous()
+            A1 = all_vecs[:, 784:784+HIDDEN_DIM].contiguous()
+            B2 = all_vecs[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM].contiguous()
+            A2 = all_vecs[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM].contiguous()
+            B3 = all_vecs[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM].contiguous()
+            A3 = all_vecs[:, 784+4*HIDDEN_DIM:].contiguous()
 
             xb_f = xb.to(torch.bfloat16)
             w1_f = w1.to(torch.bfloat16)
