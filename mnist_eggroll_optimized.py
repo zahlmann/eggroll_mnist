@@ -83,7 +83,7 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
             xb, yb = batch_data
 
             batch_key = jax.random.fold_in(epoch_rng_key, batch_idx)
-            all_vecs = jax.random.normal(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32)
+            all_vecs = jax.random.uniform(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32, minval=-1.7320508, maxval=1.7320508)
             all_vecs_f = all_vecs.astype(jnp.bfloat16)
 
             B1_f = all_vecs_f[:, :784]
