@@ -227,11 +227,11 @@ No bf16 data loading tricks — the comparison must be apples-to-apples.
 | Backprop (fp32)    | ~4.7s   | ~391MB | ~97.3%   |
 | EGGROLL baseline   | ~27.3s  | ~390MB | ~97.6%   |
 | EGGROLL optimized  | ~6.5s   | ~390MB | ~97.5%   |
-| EGGROLL optimized+ | ~5.6s   | ~433MB | ~97.4%   |
+| EGGROLL optimized+ | ~5.2s   | ~389MB | ~97.3%   |
 | Your target        | ≤5s     | ≤500MB | ≥97.2%   |
 
-Current speedup: 4.9x over baseline, 1.2x gap to backprop.
-The remaining gap is ~48% XLA JIT (lowering 0.84s + compilation 1.85s = 2.7s) and ~52% compute (2.9s).
+Current speedup: 5.3x over baseline, 1.1x gap to backprop.
+The remaining gap is ~44% XLA JIT (lowering 0.89s + compilation 1.38s = 2.27s) and ~56% compute (2.9s).
 
 Always run `benchmark.py` at the start of a session to get the current baseline.
 Check `nvidia-smi` — if another process is using the GPU, numbers will be inflated.
@@ -319,6 +319,20 @@ Check `nvidia-smi` — if another process is using the GPU, numbers will be infl
 - **BLOCK_B=128 + GROUP_SIZE=3**: 5.84s, worse occupancy and accuracy.
 - **XLA_FLAGS autotune=0**: crashes (shared memory exceeded for cuBLAS fallback).
 - **Skip fitness std normalization**: accuracy drops to 89.9%.
+- **Fused xB1_T into Triton kernel**: 10.8s — computing B1·xb dot products per-block
+  is 2× slower than cuBLAS doing the full matmul. cuBLAS is highly optimized for this.
+- **Flat single scan (2340 iters)**: tiling data 10× blows up memory to 2GB.
+- **bf16 instead of fp8 matmuls**: 5.94s — FP8 tensor cores are essential (2× throughput).
+- **Pre-cast xb to bf16 in epoch body**: no improvement, XLA already fuses the cast.
+
+### Session 3 optimization: uniform perturbations
+12. **Uniform perturbations** (5.3s → 5.2s): switched from `jax.random.normal` (Gaussian)
+    to `jax.random.uniform` with variance-matched range `[-sqrt(3), sqrt(3)]`. Eliminates
+    the Box-Muller transform from the XLA graph (log, sqrt, cos/sin ops), reducing
+    compilation time. ES convergence is comparable to Gaussian for this problem.
+13. **Merged pos/neg kernel**: single triton_call with 3D grid (HALF_POP, N_TILES, 2)
+    computes both positive and negative perturbation CE in one launch. Saves one
+    custom_call from the XLA graph, reducing compilation by ~0.04s.
 
 ### JIT profiling results
 The 2.7s JIT breaks down as: lowering (tracing) 0.84s + XLA compilation 1.85s +
