@@ -8,12 +8,12 @@ Same architecture (784-128-128-10 MLP, GELU, 10 epochs), same GPU (RTX 4080 SUPE
 
 | | Backprop | EGGROLL |
 |---|---|---|
-| **Training time** | 4.7s | 5.8s |
+| **Training time** | 4.7s | **5.2s** |
 | **Steady-state (per epoch)** | 0.2s | **0.33s** |
 | **Test accuracy** | 97.3% | 97.4% |
 | **Peak memory** | 391 MB | 389 MB |
 
-EGGROLL does **1,111x more FLOPs** than backprop (10,000 forward passes per batch vs 1 forward + 1 backward). Both times include JIT compilation (~2.3s for EGGROLL, ~3s for backprop). At steady state, EGGROLL is only **1.7x slower per epoch** despite the 1000x compute gap, thanks to a fused Triton kernel with FP8 tensor cores and compilation optimizations.
+EGGROLL does **1,111x more FLOPs** than backprop (10,000 forward passes per batch vs 1 forward + 1 backward). Both times include JIT compilation (~2.4s for EGGROLL, ~2.7s for backprop). At steady state, EGGROLL is only **1.7x slower per epoch** despite the 1000x compute gap, thanks to a fused Triton kernel with FP8 tensor cores and compilation optimizations.
 
 ### How to run
 
@@ -27,7 +27,7 @@ Requires `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/
 
 ### What made it fast
 
-The optimization went from **27s to 5.8s** (4.7x speedup). Key optimizations:
+The optimization went from **27s to 5.2s** (5.2x speedup). Key optimizations:
 
 **1. Fused 3-layer Triton kernel** (10.7s -> 7.2s, steady-state 1.0s -> 0.4s/epoch)
 
@@ -49,7 +49,7 @@ See `kernels/fused_3layer_ce.py`.
 
 Wrapping all 468 batches in `jax.lax.scan` eliminates Python loop overhead and lets XLA compile the entire epoch as one GPU program.
 
-**5. Compilation optimizations** (6.5s -> 5.8s)
+**5. Compilation optimizations** (6.5s -> 5.2s)
 
 - `num_stages=1` in Triton kernel: reducing software pipelining stages frees registers, improving occupancy
 - All-in-one JIT: wrapping all 10 epochs in a single `jax.jit` call (nested scan) eliminates Python loop overhead between epochs
@@ -57,6 +57,7 @@ Wrapping all 468 batches in `jax.lax.scan` eliminates Python loop overhead and l
 - Merged pos/neg kernel: single Triton kernel with 3D grid computes both +sigma and -sigma CE in one launch, removing one custom_call from the XLA graph
 - `fold_in` key derivation: lighter-weight per-batch key computation than `split`
 - CPU-side data: training data stays in numpy until grouped, reducing GPU peak memory
+- Updated NVIDIA library versions (cuBLAS, etc.) improved runtime by ~0.6s
 
 ### What didn't work
 
@@ -74,6 +75,11 @@ Wrapping all 468 batches in `jax.lax.scan` eliminates Python loop overhead and l
 - **Batch grouping (GROUP_SIZE=2+)**: faster but effectively changes batch size — unfair comparison
 - **Fusing xB1_T into Triton kernel**: 2x slower than cuBLAS for this matmul shape
 - **Compilation caching**: unfair (equivalent to AOT warmup across runs)
+- **Fused pos/neg in single block**: doubled compute per block outweighs L2 cache reuse
+- **Pallas (JAX native) kernels**: 10x faster JIT but auto-generated Triton is 44% slower at execution
+- **Counter-based PRNG (SplitMix32)**: reduces HLO ops from 338 to 30 but doesn't speed up JIT — the jax-triton bridge (1.07s), not PRNG, is the compilation bottleneck
+- **maxnreg register limiting**: no effect through jax-triton
+- **Framework rewrite (PyTorch)**: 4.2s EGGROLL but unfair — PyTorch backprop is 1.1s (3.8x faster than EGGROLL)
 
 ### Agent-driven optimization
 
