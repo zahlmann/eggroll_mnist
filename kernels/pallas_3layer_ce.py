@@ -8,6 +8,7 @@ Uses FP8 E4M3 tensor cores via pl.dot, same compute as the Triton version.
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as pl_triton
 from functools import partial
 
 HIDDEN = 128
@@ -30,10 +31,12 @@ def _pallas_3layer_ce_kernel(
     sigma_ref,   # (1,) f32
     T_ref,       # (1,) f32
     y_ref,       # (BLOCK_B,) i32
+    pad_mask_ref, # (OUT_DIM_PAD,) f32 — 0 for real dims, 1 for padding
     out_ref,     # (1, 1, 1) f32
 ):
     sign_idx = pl.program_id(2)
-    sign = jnp.where(sign_idx == 0, 1.0, -1.0).astype(jnp.float32)
+    # Avoid jnp.where(bool, float) which Pallas can't lower
+    sign = (1.0 - 2.0 * sign_idx.astype(jnp.float32))
 
     sigma = sigma_ref[0]
     T_val = T_ref[0]
@@ -41,25 +44,20 @@ def _pallas_3layer_ce_kernel(
 
     xB1_col = xB1_T_ref[0, :].astype(jnp.float32)
 
-    # ── K-tiled L1 forward + L2 matmul ──────────────────────────
-    base2 = jnp.zeros((BLOCK_B, HIDDEN), dtype=jnp.float32)
-    xB2 = jnp.zeros((BLOCK_B,), dtype=jnp.float32)
+    # ── L1 forward + L2 matmul (no K-tiling for debugging) ──────
+    base1_full = base1_ref[:, :].astype(jnp.float32)
+    A1_full = A1_ref[0, :].astype(jnp.float32)
 
-    for k in range(0, HIDDEN, BLOCK_K):
-        base1_k = base1_ref[:, k:k+BLOCK_K].astype(jnp.float32)
-        A1_k = A1_ref[0, k:k+BLOCK_K].astype(jnp.float32)
+    pre_act = base1_full + sign_sigma * xB1_col[:, None] * A1_full[None, :]
+    l1 = pre_act * jax.nn.sigmoid(1.702 * pre_act)
 
-        pre_act = base1_k + sign_sigma * xB1_col[:, None] * A1_k[None, :]
-        l1_k = pre_act * jax.nn.sigmoid(1.702 * pre_act)
+    base2 = pl.dot(
+        l1.astype(jnp.bfloat16),
+        w2_ref[:, :].astype(jnp.bfloat16),
+    ).astype(jnp.float32)
 
-        w2_k = w2_ref[k:k+BLOCK_K, :]
-        base2 = base2 + pl.dot(
-            l1_k.astype(jnp.float8_e4m3fn),
-            w2_k.astype(jnp.float8_e4m3fn),
-        ).astype(jnp.float32)
-
-        B2_k = B2_ref[0, k:k+BLOCK_K].astype(jnp.float32)
-        xB2 = xB2 + jnp.sum(l1_k * B2_k[None, :], axis=1)
+    B2_full = B2_ref[0, :].astype(jnp.float32)
+    xB2 = jnp.sum(l1 * B2_full[None, :], axis=1)
 
     # ── L2 activation ────────────────────────────────────────────
     A2_row = A2_ref[0, :].astype(jnp.float32)
@@ -69,8 +67,8 @@ def _pallas_3layer_ce_kernel(
     # ── Layer 3 (FP8) ────────────────────────────────────────────
     w3 = w3_ref[:, :]
     base3 = pl.dot(
-        l2.astype(jnp.float8_e4m3fn),
-        w3.astype(jnp.float8_e4m3fn),
+        l2.astype(jnp.bfloat16),
+        w3.astype(jnp.bfloat16),
     ).astype(jnp.float32)
 
     B3_row = B3_ref[0, :].astype(jnp.float32)
@@ -78,9 +76,9 @@ def _pallas_3layer_ce_kernel(
     xB3 = jnp.sum(l2 * B3_row[None, :], axis=1)
     logits = base3 + sign_sigma * xB3[:, None] * A3_row[None, :]
 
-    # Mask padding dimensions
-    pad_mask = jnp.arange(OUT_DIM_PAD) >= OUT_DIM
-    logits = jnp.where(pad_mask[None, :], -1e9, logits)
+    # Mask padding dimensions using pre-computed mask
+    pad_mask = pad_mask_ref[:].astype(jnp.float32)
+    logits = logits * (1.0 - pad_mask[None, :]) + pad_mask[None, :] * (-1e9)
 
     # ── CE loss ──────────────────────────────────────────────────
     y_labels = y_ref[:]
@@ -89,7 +87,11 @@ def _pallas_3layer_ce_kernel(
     exp_val = jnp.exp(scaled - max_val)
     log_sm = scaled - max_val - jnp.log(jnp.sum(exp_val, axis=1, keepdims=True))
 
-    one_hot = (jnp.arange(OUT_DIM_PAD)[None, :] == y_labels[:, None]).astype(jnp.float32)
+    # One-hot via diff²: avoids jnp.abs and bool ops in Pallas
+    # diff² is 0 at the correct class, ≥1 elsewhere
+    diff = jnp.arange(OUT_DIM_PAD, dtype=jnp.int32)[None, :] - y_labels[:, None]
+    diff_sq = diff * diff  # int32, always ≥ 0
+    one_hot = (1 - jnp.minimum(diff_sq, 1)).astype(jnp.float32)
     ce = -jnp.sum(log_sm * one_hot, axis=1)
 
     out_ref[0, 0, 0] = jnp.sum(ce)
@@ -106,6 +108,7 @@ def pallas_3layer_ce_both(base1, xB1_T, A1, w2, B2, A2, w3, B3, A3, sigma, T_val
     sigma_arr = sigma.reshape(1)
     T_arr = T_val.reshape(1)
     y_i32 = y.astype(jnp.int32)
+    pad_mask = jnp.array([0.0] * OUT_DIM + [1.0] * (OUT_DIM_PAD - OUT_DIM), dtype=jnp.float32)
 
     grid = (HALF_POP, N_TILES, 2)
 
@@ -114,22 +117,23 @@ def pallas_3layer_ce_both(base1, xB1_T, A1, w2, B2, A2, w3, B3, A3, sigma, T_val
         out_shape=jax.ShapeDtypeStruct((HALF_POP, N_TILES, 2), jnp.float32),
         grid=grid,
         in_specs=[
-            pl.BlockSpec(block_shape=(BLOCK_B, HIDDEN), index_map=lambda p, b, s: (b * BLOCK_B, 0)),
-            pl.BlockSpec(block_shape=(1, BLOCK_B), index_map=lambda p, b, s: (p, b * BLOCK_B)),
-            pl.BlockSpec(block_shape=(1, HIDDEN), index_map=lambda p, b, s: (p, 0)),
-            pl.BlockSpec(block_shape=(HIDDEN, HIDDEN), index_map=lambda p, b, s: (0, 0)),
-            pl.BlockSpec(block_shape=(1, HIDDEN), index_map=lambda p, b, s: (p, 0)),
-            pl.BlockSpec(block_shape=(1, HIDDEN), index_map=lambda p, b, s: (p, 0)),
-            pl.BlockSpec(block_shape=(HIDDEN, OUT_DIM_PAD), index_map=lambda p, b, s: (0, 0)),
-            pl.BlockSpec(block_shape=(1, HIDDEN), index_map=lambda p, b, s: (p, 0)),
-            pl.BlockSpec(block_shape=(1, OUT_DIM_PAD), index_map=lambda p, b, s: (p, 0)),
-            pl.BlockSpec(block_shape=(1,), index_map=lambda p, b, s: (0,)),
-            pl.BlockSpec(block_shape=(1,), index_map=lambda p, b, s: (0,)),
-            pl.BlockSpec(block_shape=(BLOCK_B,), index_map=lambda p, b, s: (b * BLOCK_B,)),
+            pl.BlockSpec(block_shape=(BLOCK_B, HIDDEN), index_map=lambda p, b, s: (b, 0)),           # base1
+            pl.BlockSpec(block_shape=(1, BLOCK_B), index_map=lambda p, b, s: (p, b)),                # xB1_T
+            pl.BlockSpec(block_shape=(1, HIDDEN), index_map=lambda p, b, s: (p, 0)),                 # A1
+            pl.BlockSpec(block_shape=(HIDDEN, HIDDEN), index_map=lambda p, b, s: (0, 0)),            # w2
+            pl.BlockSpec(block_shape=(1, HIDDEN), index_map=lambda p, b, s: (p, 0)),                 # B2
+            pl.BlockSpec(block_shape=(1, HIDDEN), index_map=lambda p, b, s: (p, 0)),                 # A2
+            pl.BlockSpec(block_shape=(HIDDEN, OUT_DIM_PAD), index_map=lambda p, b, s: (0, 0)),       # w3
+            pl.BlockSpec(block_shape=(1, HIDDEN), index_map=lambda p, b, s: (p, 0)),                 # B3
+            pl.BlockSpec(block_shape=(1, OUT_DIM_PAD), index_map=lambda p, b, s: (p, 0)),            # A3
+            pl.BlockSpec(block_shape=(1,), index_map=lambda p, b, s: (0,)),                          # sigma
+            pl.BlockSpec(block_shape=(1,), index_map=lambda p, b, s: (0,)),                          # T
+            pl.BlockSpec(block_shape=(BLOCK_B,), index_map=lambda p, b, s: (b,)),                    # y
+            pl.BlockSpec(block_shape=(OUT_DIM_PAD,), index_map=lambda p, b, s: (0,)),                # pad_mask
         ],
         out_specs=pl.BlockSpec(block_shape=(1, 1, 1), index_map=lambda p, b, s: (p, b, s)),
-        compiler_params=pl.triton.CompilerParams(num_warps=4, num_stages=1),
-    )(base1, xB1_T, A1, w2, B2, A2, w3_pad, B3, A3_pad, sigma_arr, T_arr, y_i32)
+        compiler_params=pl_triton.CompilerParams(num_warps=4, num_stages=1),
+    )(base1, xB1_T, A1, w2, B2, A2, w3_pad, B3, A3_pad, sigma_arr, T_arr, y_i32, pad_mask)
 
     # Split pos/neg from the combined output
     partial_ce_pos = out[:, :, 0]
