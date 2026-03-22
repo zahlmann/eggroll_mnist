@@ -174,15 +174,15 @@ def main():
     w2 = initializer(k2, (HIDDEN_DIM, HIDDEN_DIM), jnp.float32)
     w3 = initializer(k3, (HIDDEN_DIM, 10), jnp.float32)
 
-    # Shuffle once on CPU, group, and transfer to GPU
+    print("Training...")
+    start_time = time.perf_counter()
+
+    # Shuffle once on CPU, group, and transfer to GPU (included in timing)
     rng = np.random.default_rng(args.seed)
     n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
     perm = rng.permutation(X_train_np.shape[0])
     X_grouped = jnp.array(X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1))
     y_grouped = jnp.array(y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE))
-
-    print("Training...")
-    start_time = time.perf_counter()
 
     w1, w2, w3 = train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key)
     jax.block_until_ready(w1)
