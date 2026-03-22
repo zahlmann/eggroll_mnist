@@ -227,10 +227,11 @@ No bf16 data loading tricks — the comparison must be apples-to-apples.
 | Backprop (fp32)    | ~4.7s   | ~391MB | ~97.3%   |
 | EGGROLL baseline   | ~27.3s  | ~390MB | ~97.6%   |
 | EGGROLL optimized  | ~6.5s   | ~390MB | ~97.5%   |
+| EGGROLL optimized+ | ~5.6s   | ~433MB | ~97.4%   |
 | Your target        | ≤5s     | ≤500MB | ≥97.2%   |
 
-Current speedup: 4.2x over baseline, 1.4x gap to backprop.
-The remaining gap is ~60% XLA JIT compilation (2.8s) and ~40% kernel compute (3.6s).
+Current speedup: 4.9x over baseline, 1.2x gap to backprop.
+The remaining gap is ~48% XLA JIT (lowering 0.84s + compilation 1.85s = 2.7s) and ~52% compute (2.9s).
 
 Always run `benchmark.py` at the start of a session to get the current baseline.
 Check `nvidia-smi` — if another process is using the GPU, numbers will be inflated.
@@ -284,17 +285,60 @@ Check `nvidia-smi` — if another process is using the GPU, numbers will be infl
   1.5s on warm runs, but this is effectively AOT warmup and unfair.
 - **unsafe_rbg PRNG**: lower randomness quality dropped accuracy below threshold.
 
-## Time budget breakdown (where 6.5s goes)
+### Session 2025-03-22 (continued)
+8. **num_stages=1** (6.5s → 6.1s): reducing Triton software pipelining stages frees
+   registers used for prefetch buffers, improving occupancy.
+9. **All-in-one JIT** (6.1s → 6.0s): wrapping all 10 epochs in a single JIT call
+   eliminates Python loop overhead (per-epoch shuffling, memory measurement, key
+   management). Uses nested scan (epoch scan + batch scan).
+10. **Batch grouping GROUP_SIZE=2** (6.0s → 5.6s): process 2 batches per ES gradient
+    step (234 updates/epoch instead of 468). Same perturbation directions evaluate on
+    2× more data before weight update. Reduces PRNG/gradient/weight-update calls by 2×.
+    LR tuned to 0.015/0.92 for larger effective batch.
+11. **Epoch-level B1** (accuracy improvement): generate the largest perturbation vector
+    B1 (784 elements, 60% of random data) once per epoch. A1-A3, B2-B3 still per-batch.
+    Better accuracy margin (97.38% vs 97.32%) with no speed change.
+
+### What did NOT work (session 3)
+- **Separate Triton RNG kernel** (replacing jax.random.normal): adds Triton compile
+  overhead that offsets XLA graph simplification. Net neutral.
+- **Inline tl.randn in forward+gradient kernels**: catastrophically slow (74.7s).
+  tl.randn generates ~4B values/sec, vs JAX's ~100B values/sec bulk generation.
+- **num_warps=8**: with BLOCK_B=64, per-epoch compute 25% slower (register spilling).
+- **BLOCK_K=64 + num_stages=1**: still too much register pressure.
+- **scan unroll=2**: increases JIT by 0.3s (2× larger scan body in XLA graph).
+- **Rademacher perturbations** (random ±1): 5.89s but accuracy drops to 97.1% on
+  some seeds (Rademacher ES gradient is noisier than Gaussian).
+- **Epoch-level RNG (all vectors)**: 5.71s but accuracy collapses to 96.5% — only
+  5000 perturbation directions per epoch is not enough diversity.
+- **GROUP_SIZE=3**: 5.5s but accuracy 97.12% avg — fails validation. Even with
+  LR tuning (0.022/0.95), the accuracy margin is razor thin and unstable.
+- **GROUP_SIZE=4**: 5.49s but accuracy 96.25% — far too few gradient updates.
+- **Separate vector generation** (6 jax.random.normal calls instead of 1): 6.2s,
+  significantly slower due to extra key splitting and PRNG overhead.
+- **BLOCK_B=128 + GROUP_SIZE=3**: 5.84s, worse occupancy and accuracy.
+- **XLA_FLAGS autotune=0**: crashes (shared memory exceeded for cuBLAS fallback).
+- **Skip fitness std normalization**: accuracy drops to 89.9%.
+
+### JIT profiling results
+The 2.7s JIT breaks down as: lowering (tracing) 0.84s + XLA compilation 1.85s +
+Triton kernel compile 0.11s. The HLO graph has ~1270 ops, of which 338 (27%) are
+threefry PRNG bit operations (xor, shift, or, add). The PRNG structure dominates
+the XLA graph even though it processes data efficiently at runtime.
+
+## Time budget breakdown (where 5.6s goes)
 
 | Component | Time | Notes |
 |-----------|------|-------|
-| XLA JIT compilation | 2.8s | Compiling scan body + Triton custom_call. ~2.6s is XLA itself, ~0.2s is Triton |
-| Triton kernel (×2 per batch) | ~2.8s | 10K blocks × 2 calls × 468 batches × 10 epochs, ~53% GPU utilization |
-| Random gen + casts | ~0.4s | jax.random.normal + single bf16 cast, 468 batches × 10 epochs |
-| Gradient matmuls | ~0.3s | B.T @ (shaped * A) for 3 layers, memory-bound |
-| Other (scan overhead, etc.) | ~0.2s | XLA While loop management, data shuffling |
+| JAX lowering | 0.84s | Tracing Python → XLA HLO, includes jax-triton serialization |
+| XLA compilation | 1.85s | Optimizing nested scan HLO graph (~1270 ops, 27% PRNG) |
+| Triton kernel compile | 0.11s | First-call PTX generation |
+| Triton kernel (×2 per group) | ~2.1s | 234 groups × 2 calls × 10 epochs |
+| Random gen + casts | ~0.2s | 5000×522 normal + bf16 cast, 234 groups × 10 epochs |
+| Gradient + weight updates | ~0.2s | 3 matmuls + 3 adds, 234 groups × 10 epochs |
+| Other | ~0.3s | Epoch-level B1 gen, shuffling, scan overhead |
 
-To reach 5s: need to save 1.5s. The JIT is the elephant in the room.
+To reach 5s: need to save ~0.6s. JIT (2.7s total) is the hard wall.
 
 ## Ideas to try next
 
