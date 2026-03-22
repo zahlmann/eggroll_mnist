@@ -125,7 +125,7 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
 
             w1 = w1 + lr * grad1
             w2 = w2 + lr * grad2
-            w3 = w3 + lr * grad3
+            w3 = w3 + jnp.float32(2.0) * lr * grad3
 
             return (w1, w2, w3, batch_idx + 1), None
 
