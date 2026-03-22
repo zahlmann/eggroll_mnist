@@ -14,14 +14,15 @@ def fast_gelu(x):
     return x * jax.nn.sigmoid(1.702 * x)
 
 def get_gpu_memory_mb():
-    """Get current GPU memory usage in MB."""
+    """Get peak GPU memory usage in MB."""
     try:
         devices = jax.devices('gpu')
         if devices:
             jax.block_until_ready(jnp.zeros(1))
             stats = devices[0].memory_stats()
             if stats:
-                return stats.get('bytes_in_use', 0) / (1024 * 1024)
+                # Use peak_bytes_in_use to catch transient allocations during training
+                return stats.get('peak_bytes_in_use', stats.get('bytes_in_use', 0)) / (1024 * 1024)
     except:
         pass
     return 0.0
