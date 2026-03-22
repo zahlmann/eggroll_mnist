@@ -8,7 +8,7 @@ Same architecture (784-128-128-10 MLP, GELU, 10 epochs), same GPU (RTX 4080 SUPE
 
 | | Backprop | EGGROLL |
 |---|---|---|
-| **Training time** | 4.7s | 5.7s |
+| **Training time** | 4.7s | 5.8s |
 | **Steady-state (per epoch)** | 0.2s | **0.33s** |
 | **Test accuracy** | 97.3% | 97.4% |
 | **Peak memory** | 391 MB | 389 MB |
@@ -27,7 +27,7 @@ Requires `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/
 
 ### What made it fast
 
-The optimization went from **27s to 5.7s** (4.7x speedup). Key optimizations:
+The optimization went from **27s to 5.8s** (4.7x speedup). Key optimizations:
 
 **1. Fused 3-layer Triton kernel** (10.7s -> 7.2s, steady-state 1.0s -> 0.4s/epoch)
 
@@ -49,7 +49,7 @@ See `kernels/fused_3layer_ce.py`.
 
 Wrapping all 468 batches in `jax.lax.scan` eliminates Python loop overhead and lets XLA compile the entire epoch as one GPU program.
 
-**5. Compilation optimizations** (6.5s -> 5.7s)
+**5. Compilation optimizations** (6.5s -> 5.8s)
 
 - `num_stages=1` in Triton kernel: reducing software pipelining stages frees registers, improving occupancy
 - All-in-one JIT: wrapping all 10 epochs in a single `jax.jit` call (nested scan) eliminates Python loop overhead between epochs
