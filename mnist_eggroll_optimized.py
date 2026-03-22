@@ -68,6 +68,13 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
     # B1(784) + A1(128) + B2(128) + A2(128) + B3(128) + A3(10) = 1306
     VEC_DIM = 784 + HIDDEN_DIM * 4 + 10
 
+    # Loop-invariant scalars — hoist out of scan body
+    sigma_f32 = jnp.float32(sigma)
+    T_f32 = jnp.float32(T)
+    pos_sign = jnp.float32(1.0)
+    neg_sign = jnp.float32(-1.0)
+    scale = jnp.float32(1.0 / (2 * sigma * HALF_POPULATION))
+
     def batch_step(carry, batch_data):
         w1, w2, w3 = carry
         xb, yb, batch_key = batch_data
@@ -99,13 +106,8 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
 
         base1 = xb_f @ w1_f
         xB1_T = B1_f @ xb_f.T
-        sigma_f32 = sigma.astype(jnp.float32)
-        T_f32 = jnp.float32(T)
 
         # Fused 3-layer kernel: one call per direction, no intermediate HBM writes
-        pos_sign = jnp.float32(1.0)
-        neg_sign = jnp.float32(-1.0)
-
         partial_ce_pos = fused_3layer_ce(
             base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
             sigma_f32, T_f32, pos_sign, yb)
@@ -121,7 +123,6 @@ def train_epoch(w1, w2, w3, X_batched, y_batched, sigma, lr, key):
         std = fitness_diff.std() + 1e-8
         shaped = (fitness_diff - mean) / std
 
-        scale = 1.0 / (2 * sigma * HALF_POPULATION)
         shaped_col = shaped[:, None]
 
         grad1 = scale * B1.T @ (shaped_col * A1)
