@@ -9,10 +9,10 @@ keep going without stopping to ask for permission.*
 
 ## The Goal
 
-Backprop trains a 784→128→128→10 MLP on MNIST in ~4.5s.
-EGGROLL (Evolution Strategies with low-rank perturbations) currently takes ~27s.
+Backprop trains a 784→128→128→10 MLP on MNIST in ~4.7s.
+EGGROLL (Evolution Strategies with low-rank perturbations) currently takes ~5.8s.
 
-**Close the gap using Triton GPU kernels.**
+**Close the gap using Triton GPU kernels and other fair optimizations.**
 
 Hard constraints enforced by `validate.py`:
 - Test accuracy ≥ 97.2% (average over seeds 11, 42, 7)
@@ -82,6 +82,14 @@ Optimizations must be **honestly comparable** to the backprop baseline. Watch fo
    data for EGGROLL but fp32 for backprop is not a fair comparison.
 5. **Data subsetting**: don't silently drop training samples to reduce batch count.
    Both scripts should process the same amount of data per epoch.
+6. **Effective batch size**: the ES gradient must evaluate perturbations on
+   BATCH_SIZE=128 samples, not more. Grouping multiple batches per ES step
+   (GROUP_SIZE>1) effectively changes the batch size and is unfair.
+7. **Setup hiding**: any data preprocessing (shuffling, grouping, transfers) that
+   replaces work previously done inside `training_time_s` must remain inside the
+   timing window.
+8. **Gradient precision**: gradient computation must use fp32 perturbation vectors.
+   Do NOT substitute bf16 vectors for the gradient matmuls (`B.T @ (shaped * A)`).
 
 ---
 
@@ -150,33 +158,6 @@ i7j8k9l  0.9128  15.0  420  discard  kernel bug broke accuracy
 
 ---
 
-## Ideas to Try (roughly ordered by expected impact)
-
-### High impact
-1. **Fused perturbed-forward kernel (layer 1)**: take xb(128,784), W(784,128),
-   A(5000,128), B(5000,784), sigma → output pos(5000,128,128) and neg(5000,128,128)
-   activations. Tile over the population dimension. Avoid materializing the
-   (5000,128,784) perturbation tensor. This is the single biggest win.
-
-2. **Fused perturbed-forward + CE fitness**: extend the above to also compute
-   cross-entropy fitness inline, outputting only fitness_pos(5000,) and
-   fitness_neg(5000,). Eliminates the large logit tensors from HBM entirely.
-
-3. **Fused layer 1+2+3 in a single kernel**: pipeline the three layers.
-
-### Medium impact
-4. **Vectorized CE fitness kernel**: fuse the softmax+CE computation over
-   (5000,128,10) logits — avoids reading/writing the full tensor twice.
-
-5. **Reduce precision in fitness**: compute CE fitness in float16 (accuracy
-   only needs ~1% resolution for the ES gradient signal to work).
-
-### Lower impact / architectural
-6. Restructure population loop to improve memory access patterns
-7. Use persistent kernels to avoid kernel launch overhead across batches
-
----
-
 ## Triton + JAX Integration
 
 Install: `uv add triton jax-triton`
@@ -226,22 +207,19 @@ No bf16 data loading tricks — the comparison must be apples-to-apples.
 |--------------------|---------|--------|----------|
 | Backprop (fp32)    | ~4.7s   | ~391MB | ~97.3%   |
 | EGGROLL baseline   | ~27.3s  | ~390MB | ~97.6%   |
-| EGGROLL optimized  | ~6.5s   | ~390MB | ~97.5%   |
-| EGGROLL optimized+ | ~5.2s   | ~389MB | ~97.3%   |
+| EGGROLL optimized  | ~5.8s   | ~389MB | ~97.4%   |
 | Your target        | ≤5s     | ≤500MB | ≥97.2%   |
 
-Current speedup: 5.3x over baseline, 1.1x gap to backprop.
-The remaining gap is ~44% XLA JIT (lowering 0.89s + compilation 1.38s = 2.27s) and ~56% compute (2.9s).
+Current speedup: 4.7x over baseline, 1.2x gap to backprop.
 
 Always run `benchmark.py` at the start of a session to get the current baseline.
 Check `nvidia-smi` — if another process is using the GPU, numbers will be inflated.
 
 ## What worked so far
 
-### Session 2025-03-21
-1. **Pre-split random keys** (2.6x of the total speedup): generating all PRNG keys
-   before the batch scan breaks the sequential dependency chain, letting XLA pipeline
-   batch computations. This was the single biggest win.
+### Session 1 (27s → 10.7s)
+1. **Pre-split random keys**: generating all PRNG keys before the batch scan breaks
+   the sequential dependency chain, letting XLA pipeline batch computations.
 2. **Epoch-level scan**: wrapping all 468 batches in `jax.lax.scan` eliminates Python
    loop overhead and lets XLA compile the entire epoch as one program.
 3. **Single PRNG call**: generating one (5000, 1306) random matrix and slicing
@@ -250,7 +228,7 @@ Check `nvidia-smi` — if another process is using the GPU, numbers will be infl
    single kernel. Intermediates (l1, l2, logits) never leave registers, eliminating
    ~95% of HBM traffic vs pure JAX chunked approach.
 
-### Session 2025-03-22
+### Session 2 (10.7s → 6.5s)
 5. **K-tiled L1→L2 matmul** (7.2s → 6.6s): compute l1 in (BLOCK_B, BLOCK_K=32)
    tiles within a K-loop, feeding each tile directly into the L2 matmul accumulation.
    Only 32 columns of l1 are live at any time → register pressure drops from ~192 to
@@ -261,142 +239,117 @@ Check `nvidia-smi` — if another process is using the GPU, numbers will be infl
 7. **Single bf16 cast** (minor): cast the entire (5000, 1306) perturbation matrix to
    bf16 once instead of 6 separate per-vector casts. Simplifies XLA graph.
 
-## What did NOT work
-
-- **Triton with BLOCK_B=16**: bad tensor core utilization, slower than cuBLAS.
-- **BLOCK_B=128 with 8 warps**: register pressure kills occupancy (2 blocks/SM).
-- **BLOCK_B=32**: higher occupancy (6 blocks/SM) doesn't compensate for 33% more waves.
-- **BLOCK_K=64**: larger K-tiles increase register pressure, negating the fewer iterations.
-- **num_stages=4**: more pipeline stages consume more registers, reducing occupancy.
-- **Doubly-tiled J+K kernel**: tiling L2 output dimension (BLOCK_J=32) reduces the
-  accumulator from 64×128 to 64×32, but recomputing GELU 4× per J-tile costs more
-  than the occupancy gain (0.7s/epoch vs 0.4s).
-- **Merging pos/neg into one kernel call**: sign loop doubles block execution time
-  without improving concurrency. Shared data loads save ~25ms/epoch but don't
-  compensate for the complexity.
-- **Pure JAX (no Triton)**: 12.8s. JIT is nearly the same (2.6s vs 2.8s) — the JIT
-  bottleneck is XLA compilation of the scan body, NOT Triton kernel compilation.
-  Per-epoch is 2.5× slower due to HBM traffic for intermediates.
-- **Per-batch JIT (no scan)**: 7.0s. Removing the scan doesn't help JIT and loses
-  XLA optimization benefits.
-- **bf16 gradient matmuls**: saves 0.06s/epoch compute but adds 0.5s to XLA JIT.
-  The mixed-precision matmul creates a more complex XLA graph.
-- **Compilation caching** (`jax_compilation_cache_dir`): reduces JIT from 2.8s to
-  1.5s on warm runs, but this is effectively AOT warmup and unfair.
-- **unsafe_rbg PRNG**: lower randomness quality dropped accuracy below threshold.
-
-### Session 2025-03-22 (continued)
+### Session 3 (6.5s → 5.8s)
 8. **num_stages=1** (6.5s → 6.1s): reducing Triton software pipelining stages frees
    registers used for prefetch buffers, improving occupancy.
 9. **All-in-one JIT** (6.1s → 6.0s): wrapping all 10 epochs in a single JIT call
-   eliminates Python loop overhead (per-epoch shuffling, memory measurement, key
-   management). Uses nested scan (epoch scan + batch scan).
-10. **Batch grouping GROUP_SIZE=2** (6.0s → 5.6s): process 2 batches per ES gradient
-    step (234 updates/epoch instead of 468). Same perturbation directions evaluate on
-    2× more data before weight update. Reduces PRNG/gradient/weight-update calls by 2×.
-    LR tuned to 0.015/0.92 for larger effective batch.
-11. **Epoch-level B1** (accuracy improvement): generate the largest perturbation vector
-    B1 (784 elements, 60% of random data) once per epoch. A1-A3, B2-B3 still per-batch.
-    Better accuracy margin (97.38% vs 97.32%) with no speed change.
+   eliminates Python loop overhead. Uses nested scan (epoch scan + batch scan).
+10. **Shuffle-once on CPU** (6.0s → 5.8s): data shuffled once before training
+    (included in timing), removing `jax.random.permutation` + fancy indexing from
+    the XLA graph. Training data kept in numpy to reduce GPU memory.
+11. **Merged pos/neg kernel**: single triton_call with 3D grid (HALF_POP, N_TILES, 2)
+    computes both +sigma and -sigma CE in one launch. Removes one custom_call from
+    the XLA graph, reducing compilation by ~0.04s.
+12. **fold_in key derivation**: `jax.random.fold_in` for per-batch keys instead of
+    pre-splitting with `jax.random.split`.
 
-### What did NOT work (session 3)
-- **Separate Triton RNG kernel** (replacing jax.random.normal): adds Triton compile
-  overhead that offsets XLA graph simplification. Net neutral.
+## What did NOT work
+
+### Kernel parameter tuning
+- **BLOCK_B=16**: bad tensor core utilization, slower than cuBLAS.
+- **BLOCK_B=32**: higher occupancy (6 blocks/SM) doesn't compensate for 33% more waves.
+- **BLOCK_B=128**: register pressure kills occupancy (2 blocks/SM).
+- **BLOCK_K=64**: larger K-tiles increase register pressure even with num_stages=1.
+- **num_stages=4**: more pipeline stages consume more registers, reducing occupancy.
+- **num_warps=8**: with BLOCK_B=64, per-epoch compute 25% slower (register spilling).
+- **num_warps=2**: worse occupancy than num_warps=4.
+- **bf16 instead of fp8 matmuls**: 5.94s — FP8 tensor cores are essential (2× throughput).
+
+### Kernel restructuring
+- **Doubly-tiled J+K kernel**: tiling L2 output dimension (BLOCK_J=32) reduces the
+  accumulator from 64×128 to 64×32, but recomputing GELU 4× per J-tile costs more
+  than the occupancy gain (0.7s/epoch vs 0.4s).
+- **Fusing xB1_T into Triton kernel**: 10.8s — computing B1·xb dot products per-block
+  is 2× slower than cuBLAS doing the full matmul.
+
+### Random generation
+- **Separate Triton RNG kernel** (replacing jax.random.normal): Triton compile
+  overhead offsets XLA graph simplification. Net neutral.
 - **Inline tl.randn in forward+gradient kernels**: catastrophically slow (74.7s).
   tl.randn generates ~4B values/sec, vs JAX's ~100B values/sec bulk generation.
-- **num_warps=8**: with BLOCK_B=64, per-epoch compute 25% slower (register spilling).
-- **BLOCK_K=64 + num_stages=1**: still too much register pressure.
-- **scan unroll=2**: increases JIT by 0.3s (2× larger scan body in XLA graph).
-- **Rademacher perturbations** (random ±1): 5.89s but accuracy drops to 97.1% on
-  some seeds (Rademacher ES gradient is noisier than Gaussian).
-- **Epoch-level RNG (all vectors)**: 5.71s but accuracy collapses to 96.5% — only
-  5000 perturbation directions per epoch is not enough diversity.
-- **GROUP_SIZE=3**: 5.5s but accuracy 97.12% avg — fails validation. Even with
-  LR tuning (0.022/0.95), the accuracy margin is razor thin and unstable.
-- **GROUP_SIZE=4**: 5.49s but accuracy 96.25% — far too few gradient updates.
 - **Separate vector generation** (6 jax.random.normal calls instead of 1): 6.2s,
   significantly slower due to extra key splitting and PRNG overhead.
-- **BLOCK_B=128 + GROUP_SIZE=3**: 5.84s, worse occupancy and accuracy.
-- **XLA_FLAGS autotune=0**: crashes (shared memory exceeded for cuBLAS fallback).
-- **Skip fitness std normalization**: accuracy drops to 89.9%.
-- **Fused xB1_T into Triton kernel**: 10.8s — computing B1·xb dot products per-block
-  is 2× slower than cuBLAS doing the full matmul. cuBLAS is highly optimized for this.
-- **Flat single scan (2340 iters)**: tiling data 10× blows up memory to 2GB.
-- **bf16 instead of fp8 matmuls**: 5.94s — FP8 tensor cores are essential (2× throughput).
-- **Pre-cast xb to bf16 in epoch body**: no improvement, XLA already fuses the cast.
+- **unsafe_rbg PRNG**: lower randomness quality dropped accuracy below threshold.
 
-### Session 3 optimization: uniform perturbations
-12. **Uniform perturbations** (5.3s → 5.2s): switched from `jax.random.normal` (Gaussian)
-    to `jax.random.uniform` with variance-matched range `[-sqrt(3), sqrt(3)]`. Eliminates
-    the Box-Muller transform from the XLA graph (log, sqrt, cos/sin ops), reducing
-    compilation time. ES convergence is comparable to Gaussian for this problem.
-13. **Merged pos/neg kernel**: single triton_call with 3D grid (HALF_POP, N_TILES, 2)
-    computes both positive and negative perturbation CE in one launch. Saves one
-    custom_call from the XLA graph, reducing compilation by ~0.04s.
+### Algorithmic changes (tried and reverted for fairness or accuracy)
+- **Rademacher perturbations** (random ±1): 5.89s but accuracy drops to 97.1% on
+  some seeds. Noisier than Gaussian.
+- **Uniform perturbations** (uniform[-sqrt(3), sqrt(3)]): saves ~0.1s compilation
+  but accuracy margin too thin without other changes.
+- **Epoch-level RNG (all vectors)**: 5.71s but accuracy collapses to 96.5% — only
+  5000 perturbation directions per epoch is not enough diversity.
+- **Epoch-level B1 only**: marginal accuracy improvement but no speed gain.
+- **GROUP_SIZE=2** (2 batches per ES step): 5.2s but effectively changes batch size
+  from 128 to 256 — removed as unfair.
+- **GROUP_SIZE=3/4**: accuracy fails validation (<97.2%).
+- **Skip fitness std normalization**: accuracy drops to 89.9%.
+
+### XLA/compilation
+- **Pure JAX (no Triton)**: 12.8s. JIT is nearly the same (2.6s vs 2.8s) — the JIT
+  bottleneck is XLA compilation of the scan body, NOT Triton kernel compilation.
+- **Per-batch JIT (no scan)**: 7.0s. Removing the scan doesn't help JIT and loses
+  XLA optimization benefits.
+- **bf16 gradient matmuls**: saves 0.06s/epoch compute but adds 0.5s to XLA JIT.
+- **Compilation caching** (`jax_compilation_cache_dir`): unfair (AOT warmup).
+- **scan unroll=2**: increases JIT by 0.3s (2× larger scan body in XLA graph).
+- **XLA_FLAGS autotune=0**: crashes (shared memory exceeded for cuBLAS fallback).
+- **Flat single scan (2340 iters)**: tiling data 10× blows up memory to 2GB.
+- **Pre-cast xb to bf16 in epoch body**: no improvement, XLA already fuses the cast.
+- **Per-epoch JIT (instead of all-in-one)**: 5.8s time but 750MB memory — over limit.
 
 ### JIT profiling results
-The 2.7s JIT breaks down as: lowering (tracing) 0.84s + XLA compilation 1.85s +
+The 2.3s JIT breaks down as: lowering (tracing) 0.89s + XLA compilation 1.38s +
 Triton kernel compile 0.11s. The HLO graph has ~1270 ops, of which 338 (27%) are
 threefry PRNG bit operations (xor, shift, or, add). The PRNG structure dominates
 the XLA graph even though it processes data efficiently at runtime.
 
-## Time budget breakdown (where 5.6s goes)
+## Time budget breakdown (where 5.8s goes)
 
 | Component | Time | Notes |
 |-----------|------|-------|
-| JAX lowering | 0.84s | Tracing Python → XLA HLO, includes jax-triton serialization |
-| XLA compilation | 1.85s | Optimizing nested scan HLO graph (~1270 ops, 27% PRNG) |
-| Triton kernel compile | 0.11s | First-call PTX generation |
-| Triton kernel (×2 per group) | ~2.1s | 234 groups × 2 calls × 10 epochs |
-| Random gen + casts | ~0.2s | 5000×522 normal + bf16 cast, 234 groups × 10 epochs |
-| Gradient + weight updates | ~0.2s | 3 matmuls + 3 adds, 234 groups × 10 epochs |
-| Other | ~0.3s | Epoch-level B1 gen, shuffling, scan overhead |
+| JAX lowering | 0.89s | Tracing Python → XLA HLO, includes jax-triton serialization |
+| XLA compilation | 1.38s | Optimizing nested scan HLO graph (~1270 ops, 27% PRNG) |
+| Triton kernel compile | 0.11s | First-call PTX generation for the fused forward kernel |
+| Triton kernel (×1 per batch) | ~2.1s | 20K blocks × 1 merged call × 468 batches × 10 epochs |
+| Random gen + casts | ~0.4s | jax.random.normal (5000×1306) + bf16 cast, 468 batches × 10 epochs |
+| Gradient matmuls | ~0.3s | B.T @ (shaped * A) for 3 layers, fp32, 468 batches × 10 epochs |
+| Data shuffle + other | ~0.6s | CPU shuffle, weight updates, scan overhead |
 
-To reach 5s: need to save ~0.6s. JIT (2.7s total) is the hard wall.
+To reach 5s: need to save ~0.8s. The XLA JIT (2.4s) is the dominant cost.
 
 ## Ideas to try next
 
-### Reducing JIT (the bottleneck — 2.8s of 6.5s)
-1. **Pallas kernels**: JAX's native kernel language compiles as part of XLA, potentially
-   eliminating the Triton custom_call overhead. BUT: Pallas uses Triton as GPU backend,
-   so the savings may be zero. Worth testing to confirm.
-2. **Simpler scan body**: reduce the number of XLA ops by fusing more computation into
-   the Triton kernel (e.g., bf16 casts, base1/xB1_T matmuls). Each eliminated XLA op
-   might shave ms off compilation.
-3. **JAX version upgrade**: newer JAX versions may have faster XLA compilation.
+### Most promising
+1. **Reduce XLA compilation of PRNG**: the threefry PRNG accounts for 27% of the
+   HLO graph. Finding a way to simplify it (different PRNG, or moving it out of the
+   inner scan body) would reduce compilation. CAUTION: epoch-level RNG kills accuracy;
+   tl.randn is too slow; separate Triton RNG kernel is neutral. A new approach is needed.
+2. **Pallas kernels**: JAX's native kernel language compiles as part of XLA, potentially
+   eliminating the jax-triton custom_call overhead in lowering (~0.89s). BUT: Pallas
+   uses Triton as GPU backend, so savings may be zero. Worth testing.
+3. **Reduce kernel register pressure**: the forward kernel uses ~113 regs/thread giving
+   only 25% occupancy (4 blocks/SM). Getting to 6+ blocks/SM would speed up compute.
+   The base2 accumulator (64×128 fp32 = 64 regs/thread) is the biggest hog. Ideas:
+   - Store partial accumulators in shared memory between J-tiles (avoids GELU recompute)
+   - Use bf16 accumulation for L2 matmul (risky for accuracy)
+   - Find a tiling that reduces accumulator size without recompute penalty
 
-### Reducing kernel compute (0.36s/epoch, needs ~0.22s for 5s target)
-4. **Fuse random generation into Triton kernel**: use `tl.randn(seed, offset)` to
-   generate perturbation vectors on-the-fly inside the kernel, eliminating HBM round-trip
-   for random vectors (~40MB/batch). Challenge: gradient computation still needs the
-   vectors, so either write them to HBM from the kernel (same traffic) or regenerate
-   them in a separate gradient kernel (same seed/offset → same values).
-5. **Gradient accumulation inside forward kernel**: output gradient contributions
-   directly instead of fitness. Each block would atomicAdd its `shaped[p] * outer(B[p], A[p])`
-   contribution to the gradient. Problem: 5000 × 100K atomics per batch is ~50ms.
-   Could work if done with block-level reduction (groups of 50-100 members reduce
-   locally before atomicAdd).
-6. **Better tensor core utilization**: current ~53% utilization. The bottleneck is
-   occupancy (4 blocks/SM, 25%). Ideas:
-   - Reduce register pressure further (currently ~113 regs/thread)
-   - Use `tl.dot` with accumulator directly (done, `base2 = tl.dot(a, b, base2)`)
-   - Experiment with num_warps=2 (fewer threads per block, more blocks per SM)
-7. **Process base1 and xB1_T matmuls inside the Triton kernel**: currently these are
-   separate cuBLAS calls. Moving them into the kernel eliminates 2 kernel launches
-   per batch and reduces the scan body's XLA graph.
-
-### Reducing non-kernel overhead
-8. **Overlap data shuffling with training**: pre-compute next epoch's permutation
-   during current epoch. Requires breaking the key dependency chain (pre-generate
-   all epoch keys).
-9. **Skip fitness normalization**: use raw `fitness_diff` instead of `(fitness_diff - mean) / std`.
-   This allows streaming gradient accumulation (no need to see all 5000 fitness values
-   before computing gradients). Might hurt convergence — needs accuracy testing.
-
-### Speculative / architectural
-10. **Rewrite in PyTorch + Triton**: eliminates JAX's XLA JIT entirely (~2.8s savings).
-    Not allowed by current pyproject.toml constraints, but would immediately reach ~3.7s.
-11. **CUDA Graphs**: capture the entire training loop as a CUDA graph to eliminate
-    per-kernel launch overhead. JAX has experimental support via `jax.experimental.export`.
-12. **Multi-stream execution**: overlap pos/neg kernel calls using separate CUDA streams.
-    Not easily possible through jax-triton but could work with raw CUDA integration.
+### Other ideas
+4. **CUDA Graphs via JAX**: capture the training loop as a CUDA graph to eliminate
+   per-kernel launch overhead. JAX has experimental support.
+5. **Overlap computation**: overlap PRNG generation with previous batch's gradient
+   computation using async execution.
+6. **Persistent kernels**: keep blocks resident on SMs across batches, amortizing
+   weight loads (w2, w3 are shared across all population members).
+7. **PyTorch + Triton rewrite**: eliminates JAX's XLA JIT entirely (~2.4s savings).
+   Would immediately reach ~3.4s but requires adding torch to pyproject.toml.
