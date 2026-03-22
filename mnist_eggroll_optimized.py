@@ -54,6 +54,8 @@ SIGMA_DECAY = 0.998
 
 N_BATCHES = (X_train.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
+GROUP_SIZE = 4  # process this many batches per ES gradient step
+N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 // 4 = 117 groups
 
 
 @jax.jit
@@ -67,24 +69,25 @@ def train_all_epochs(w1, w2, w3, X_train, y_train, key):
     def epoch_step(carry, _):
         w1, w2, w3, key, sigma, lr = carry
 
-        # Shuffle data for this epoch
+        # Shuffle data for this epoch, grouped into chunks of GROUP_SIZE batches
         key, data_key = jax.random.split(key)
+        n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE  # 117 * 4 * 128 = 59904
         perm = jax.random.permutation(data_key, X_train.shape[0])
-        X_shuf = X_train[perm][:N_BATCHES * BATCH_SIZE].reshape(N_BATCHES, BATCH_SIZE, -1)
-        y_shuf = y_train[perm][:N_BATCHES * BATCH_SIZE].reshape(N_BATCHES, BATCH_SIZE)
+        X_shuf = X_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)
+        y_shuf = y_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE)
 
-        # Pre-split keys for batch RNG
-        key, batch_key = jax.random.split(key)
-        all_keys = jax.random.split(batch_key, N_BATCHES)
+        # Use fold_in for per-batch key derivation (cheaper than split)
+        key, epoch_rng_key = jax.random.split(key)
 
         sigma_f32 = jnp.float32(sigma)
         T_f32 = jnp.float32(T)
         scale = jnp.float32(1.0) / (jnp.float32(2.0) * sigma_f32 * jnp.float32(HALF_POPULATION))
 
         def batch_step(carry, batch_data):
-            w1, w2, w3 = carry
-            xb, yb, batch_key = batch_data
+            w1, w2, w3, batch_idx = carry
+            xb, yb = batch_data
 
+            batch_key = jax.random.fold_in(epoch_rng_key, batch_idx)
             all_vecs = jax.random.normal(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32)
             all_vecs_f = all_vecs.astype(jnp.bfloat16)
 
@@ -117,9 +120,8 @@ def train_all_epochs(w1, w2, w3, X_train, y_train, key):
                 base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
                 sigma_f32, T_f32, neg_sign, yb)
 
-            ce_pos = partial_ce_pos.sum(axis=1) / BATCH_SIZE
-            ce_neg = partial_ce_neg.sum(axis=1) / BATCH_SIZE
-            fitness_diff = ce_neg - ce_pos
+            # Skip /BATCH_SIZE — normalization absorbs the constant scale
+            fitness_diff = partial_ce_neg.sum(axis=1) - partial_ce_pos.sum(axis=1)
             mean = fitness_diff.mean()
             std = fitness_diff.std() + 1e-8
             shaped = (fitness_diff - mean) / std
@@ -133,9 +135,9 @@ def train_all_epochs(w1, w2, w3, X_train, y_train, key):
             w2 = w2 + lr * grad2
             w3 = w3 + lr * grad3
 
-            return (w1, w2, w3), None
+            return (w1, w2, w3, batch_idx + 1), None
 
-        (w1, w2, w3), _ = jax.lax.scan(batch_step, (w1, w2, w3), (X_shuf, y_shuf, all_keys))
+        (w1, w2, w3, _), _ = jax.lax.scan(batch_step, (w1, w2, w3, jnp.int32(0)), (X_shuf, y_shuf))
 
         sigma = sigma * SIGMA_DECAY
         lr = lr * LR_DECAY
