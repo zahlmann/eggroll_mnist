@@ -8,12 +8,12 @@ Same architecture (784-128-128-10 MLP, GELU, 10 epochs), same GPU (RTX 4080 SUPE
 
 | | Backprop | EGGROLL |
 |---|---|---|
-| **Training time** | 4.7s | 6.5s |
-| **Steady-state (per epoch)** | 0.2s | **0.36s** |
-| **Test accuracy** | 97.3% | 97.5% |
-| **Peak memory** | 391 MB | 390 MB |
+| **Training time** | 4.7s | 5.2s |
+| **Steady-state (per epoch)** | 0.2s | **0.29s** |
+| **Test accuracy** | 97.3% | 97.3% |
+| **Peak memory** | 391 MB | 389 MB |
 
-EGGROLL does **1,111x more FLOPs** than backprop (10,000 forward passes per batch vs 1 forward + 1 backward). Both times include JIT compilation on epoch 1 (~3s each). At steady state, EGGROLL is only **1.8x slower per epoch** despite the 1000x compute gap, thanks to a fused Triton kernel with FP8 tensor cores.
+EGGROLL does **1,111x more FLOPs** than backprop (10,000 forward passes per batch vs 1 forward + 1 backward). Both times include JIT compilation (~2.3s for EGGROLL, ~3s for backprop). At steady state, EGGROLL is only **1.5x slower per epoch** despite the 1000x compute gap, thanks to a fused Triton kernel with FP8 tensor cores and algorithmic optimizations.
 
 ### How to run
 
@@ -27,13 +27,13 @@ Requires `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/
 
 ### What made it fast
 
-The optimization went from **27s to 6.5s** (4.2x speedup). Four things mattered:
+The optimization went from **27s to 5.2s** (5.2x speedup). Key optimizations:
 
 **1. Fused 3-layer Triton kernel** (10.7s -> 7.2s, steady-state 1.0s -> 0.4s/epoch)
 
 The bottleneck was memory bandwidth: intermediate activations (`l1`, `l2`, logits) were written to HBM then re-read multiple times per forward pass. A custom Triton kernel fuses all three layers + cross-entropy fitness into a single GPU kernel where intermediates stay in registers. This eliminates ~95% of HBM traffic.
 
-**2. K-tiled L1→L2 matmul + FP8 tensor cores** (7.2s -> 6.5s, steady-state 0.4s -> 0.36s/epoch)
+**2. K-tiled L1->L2 matmul + FP8 tensor cores** (7.2s -> 6.5s, steady-state 0.4s -> 0.36s/epoch)
 
 The original kernel loaded full `l1` (64x128) and `w2` (128x128) simultaneously, causing high register pressure (~192 regs/thread, only 25% occupancy). The K-tiled approach computes `l1` in (64, 32) tiles within a K-loop, feeding each tile directly into the L2 matmul accumulation. Only 32 columns of `l1` are live at any time, halving register pressure (~113 regs/thread, 4 blocks/SM).
 
@@ -43,22 +43,36 @@ See `kernels/fused_3layer_ce.py`.
 
 **3. Pre-split PRNG keys** (27s -> 10.7s)
 
-`jax.random.split(key)` inside a `jax.lax.scan` loop creates a sequential dependency between batches (each batch's key depends on the previous). Pre-generating all 468 keys before the scan breaks this chain, letting XLA pipeline batch computations.
+`jax.random.split(key)` inside a `jax.lax.scan` loop creates a sequential dependency between batches (each batch's key depends on the previous). Pre-generating all keys before the scan breaks this chain, letting XLA pipeline batch computations.
 
 **4. Epoch-level scan** (saves ~3s)
 
 Wrapping all 468 batches in `jax.lax.scan` eliminates Python loop overhead and lets XLA compile the entire epoch as one GPU program.
+
+**5. Algorithmic + compilation optimizations** (6.5s -> 5.2s)
+
+- `num_stages=1` in Triton kernel: reducing software pipelining stages frees registers, improving occupancy
+- All-in-one JIT: wrapping all 10 epochs in a single `jax.jit` call eliminates Python loop overhead between epochs
+- Batch grouping (GROUP_SIZE=2): each ES gradient step evaluates perturbations on 256 samples (2 consecutive batches), halving the number of PRNG/gradient/weight-update calls per epoch from 468 to 234
+- Shuffle-once on CPU: data is shuffled once and kept in fixed order across epochs (random perturbations provide sufficient variance between epochs)
+- Merged pos/neg kernel: single Triton kernel with 3D grid computes both +sigma and -sigma CE in one launch
+- Uniform perturbations: `uniform[-sqrt(3), sqrt(3)]` replaces Gaussian, eliminating the Box-Muller transform from the XLA graph and reducing compilation time
+- `fold_in` key derivation: lighter-weight per-batch key computation than `split`
 
 ### What didn't work
 
 - **BLOCK_B=16 or 128**: bad tensor core utilization (16) or register spilling (128)
 - **BLOCK_K=64, num_stages=4**: higher register pressure hurts occupancy
 - **Doubly-tiled J+K kernel**: recomputing GELU 4x per J-tile costs more than the occupancy gain
-- **Merging pos/neg directions in one kernel call**: sign loop doubles block time without improving concurrency
+- **Inline tl.randn**: generating random values inside the Triton kernel is ~25x slower than JAX's bulk CUDA generation
+- **Separate Triton RNG kernel**: compile overhead offsets any XLA graph simplification
 - **Pure JAX (no Triton)**: 2.5x slower per-epoch; the fused kernel's HBM savings are essential
 - **Per-batch JIT (no scan)**: scan gives better XLA optimization than a Python loop
 - **bf16 gradient matmuls**: saves 0.06s/epoch compute but adds 0.5s to JIT compilation
-- **unsafe_rbg PRNG**: accuracy dropped below threshold
+- **Rademacher perturbations**: random +/-1 is too noisy for reliable 97.2% accuracy
+- **Epoch-level random vectors**: reusing perturbation vectors for all batches in an epoch collapses accuracy to 96.5%
+- **GROUP_SIZE=3+**: accuracy drops below threshold due to insufficient gradient updates
+- **Fusing xB1_T into Triton kernel**: 2x slower than cuBLAS for this matmul shape
 - **Compilation caching**: unfair (equivalent to AOT warmup across runs)
 
 ### Agent-driven optimization
