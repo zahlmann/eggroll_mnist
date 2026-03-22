@@ -21,6 +21,7 @@ def get_gpu_memory_mb():
             jax.block_until_ready(jnp.zeros(1))
             stats = devices[0].memory_stats()
             if stats:
+                # Use peak_bytes_in_use to catch transient allocations during training
                 return stats.get('peak_bytes_in_use', stats.get('bytes_in_use', 0)) / (1024 * 1024)
     except:
         pass
@@ -52,77 +53,101 @@ SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
 N_BATCHES = (X_train.shape[0] // BATCH_SIZE)  # drop last incomplete batch
+VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
+SMALL_VEC_DIM = HIDDEN_DIM * 4 + 10  # A1+B2+A2+B3+A3 = 522 (without B1)
 GROUP_SIZE = 2  # process this many batches per ES gradient step
 N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 // 2 = 234 groups
-SMALL_VEC_DIM = HIDDEN_DIM * 4 + 10  # A1+B2+A2+B3+A3 = 522 (without B1)
 
 
-@partial(jax.jit, donate_argnums=(3, 4))
-def train_epoch(w1, w2, w3, X_grouped, y_grouped, B1, B1_f, sigma, lr, key):
-    """Train one epoch with single-level scan (faster compilation than nested scan)."""
+@jax.jit
+def train_all_epochs(w1, w2, w3, X_train, y_train, key):
+    """Train all epochs in a single JIT call — eliminates Python loop overhead."""
 
+    # Loop-invariant scalars
     pos_sign = jnp.float32(1.0)
     neg_sign = jnp.float32(-1.0)
 
-    key, epoch_rng_key = jax.random.split(key)
-    sigma_f32 = jnp.float32(sigma)
-    T_f32 = jnp.float32(T)
-    scale = jnp.float32(1.0) / (jnp.float32(2.0) * sigma_f32 * jnp.float32(HALF_POPULATION))
+    def epoch_step(carry, _):
+        w1, w2, w3, key, sigma, lr = carry
 
-    def batch_step(carry, batch_data):
-        w1, w2, w3, batch_idx = carry
-        xb, yb = batch_data
+        # Generate B1 ONCE per epoch (784 elements = 60% of random data)
+        key, b1_key, data_key, epoch_rng_key = jax.random.split(key, 4)
+        B1 = jax.random.normal(b1_key, (HALF_POPULATION, 784), dtype=jnp.float32)
+        B1_f = B1.astype(jnp.bfloat16)
 
-        # Generate only smaller vectors per batch (522 elements instead of 1306)
-        batch_key = jax.random.fold_in(epoch_rng_key, batch_idx)
-        small_vecs = jax.random.normal(batch_key, (HALF_POPULATION, SMALL_VEC_DIM), dtype=jnp.float32)
-        small_vecs_f = small_vecs.astype(jnp.bfloat16)
+        # Shuffle data for this epoch, grouped into chunks of GROUP_SIZE batches
+        n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
+        perm = jax.random.permutation(data_key, X_train.shape[0])
+        X_shuf = X_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)
+        y_shuf = y_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE)
 
-        A1_f = small_vecs_f[:, :HIDDEN_DIM]
-        B2_f = small_vecs_f[:, HIDDEN_DIM:2*HIDDEN_DIM]
-        A2_f = small_vecs_f[:, 2*HIDDEN_DIM:3*HIDDEN_DIM]
-        B3_f = small_vecs_f[:, 3*HIDDEN_DIM:4*HIDDEN_DIM]
-        A3_f = small_vecs_f[:, 4*HIDDEN_DIM:]
+        sigma_f32 = jnp.float32(sigma)
+        T_f32 = jnp.float32(T)
+        scale = jnp.float32(1.0) / (jnp.float32(2.0) * sigma_f32 * jnp.float32(HALF_POPULATION))
 
-        A1 = small_vecs[:, :HIDDEN_DIM]
-        B2 = small_vecs[:, HIDDEN_DIM:2*HIDDEN_DIM]
-        A2 = small_vecs[:, 2*HIDDEN_DIM:3*HIDDEN_DIM]
-        B3 = small_vecs[:, 3*HIDDEN_DIM:4*HIDDEN_DIM]
-        A3 = small_vecs[:, 4*HIDDEN_DIM:]
+        def batch_step(carry, batch_data):
+            w1, w2, w3, batch_idx = carry
+            xb, yb = batch_data
 
-        xb_f = xb.astype(jnp.bfloat16)
-        w1_f = w1.astype(jnp.bfloat16)
-        w2_f = w2.astype(jnp.bfloat16)
-        w3_f = w3.astype(jnp.bfloat16)
+            # Generate only smaller vectors per batch (522 elements instead of 1306)
+            batch_key = jax.random.fold_in(epoch_rng_key, batch_idx)
+            small_vecs = jax.random.normal(batch_key, (HALF_POPULATION, SMALL_VEC_DIM), dtype=jnp.float32)
+            small_vecs_f = small_vecs.astype(jnp.bfloat16)
 
-        base1 = xb_f @ w1_f
-        xB1_T = B1_f @ xb_f.T  # uses epoch-level B1_f
+            A1_f = small_vecs_f[:, :HIDDEN_DIM]
+            B2_f = small_vecs_f[:, HIDDEN_DIM:2*HIDDEN_DIM]
+            A2_f = small_vecs_f[:, 2*HIDDEN_DIM:3*HIDDEN_DIM]
+            B3_f = small_vecs_f[:, 3*HIDDEN_DIM:4*HIDDEN_DIM]
+            A3_f = small_vecs_f[:, 4*HIDDEN_DIM:]
 
-        partial_ce_pos = fused_3layer_ce(
-            base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
-            sigma_f32, T_f32, pos_sign, yb)
-        partial_ce_neg = fused_3layer_ce(
-            base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
-            sigma_f32, T_f32, neg_sign, yb)
+            A1 = small_vecs[:, :HIDDEN_DIM]
+            B2 = small_vecs[:, HIDDEN_DIM:2*HIDDEN_DIM]
+            A2 = small_vecs[:, 2*HIDDEN_DIM:3*HIDDEN_DIM]
+            B3 = small_vecs[:, 3*HIDDEN_DIM:4*HIDDEN_DIM]
+            A3 = small_vecs[:, 4*HIDDEN_DIM:]
 
-        fitness_diff = partial_ce_neg.sum(axis=1) - partial_ce_pos.sum(axis=1)
-        mean = fitness_diff.mean()
-        std = fitness_diff.std() + 1e-8
-        shaped = (fitness_diff - mean) / std
+            xb_f = xb.astype(jnp.bfloat16)
+            w1_f = w1.astype(jnp.bfloat16)
+            w2_f = w2.astype(jnp.bfloat16)
+            w3_f = w3.astype(jnp.bfloat16)
 
-        shaped_col = shaped[:, None]
-        grad1 = scale * B1.T @ (shaped_col * A1)  # uses epoch-level B1
-        grad2 = scale * B2.T @ (shaped_col * A2)
-        grad3 = scale * B3.T @ (shaped_col * A3)
+            base1 = xb_f @ w1_f
+            xB1_T = B1_f @ xb_f.T
 
-        w1 = w1 + lr * grad1
-        w2 = w2 + lr * grad2
-        w3 = w3 + lr * grad3
+            partial_ce_pos = fused_3layer_ce(
+                base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
+                sigma_f32, T_f32, pos_sign, yb)
+            partial_ce_neg = fused_3layer_ce(
+                base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
+                sigma_f32, T_f32, neg_sign, yb)
 
-        return (w1, w2, w3, batch_idx + 1), None
+            # Skip /BATCH_SIZE — normalization absorbs the constant scale
+            fitness_diff = partial_ce_neg.sum(axis=1) - partial_ce_pos.sum(axis=1)
+            mean = fitness_diff.mean()
+            std = fitness_diff.std() + 1e-8
+            shaped = (fitness_diff - mean) / std
 
-    (w1, w2, w3, _), _ = jax.lax.scan(batch_step, (w1, w2, w3, jnp.int32(0)), (X_grouped, y_grouped))
-    return w1, w2, w3, key
+            shaped_col = shaped[:, None]
+            grad1 = scale * B1.T @ (shaped_col * A1)
+            grad2 = scale * B2.T @ (shaped_col * A2)
+            grad3 = scale * B3.T @ (shaped_col * A3)
+
+            w1 = w1 + lr * grad1
+            w2 = w2 + lr * grad2
+            w3 = w3 + lr * grad3
+
+            return (w1, w2, w3, batch_idx + 1), None
+
+        (w1, w2, w3, _), _ = jax.lax.scan(batch_step, (w1, w2, w3, jnp.int32(0)), (X_shuf, y_shuf))
+
+        sigma = sigma * SIGMA_DECAY
+        lr = lr * LR_DECAY
+
+        return (w1, w2, w3, key, sigma, lr), None
+
+    init = (w1, w2, w3, key, jnp.float32(SIGMA_START), jnp.float32(LR_START))
+    (w1, w2, w3, key, _, _), _ = jax.lax.scan(epoch_step, init, None, length=EPOCHS)
+    return w1, w2, w3
 
 
 @jax.jit
@@ -139,6 +164,7 @@ def main():
     parser.add_argument("--seed", type=int, default=11)
     args = parser.parse_args()
 
+    # Print locked constants — validate.py parses this block
     print("=== CONSTANTS ===")
     print(f"HIDDEN_DIM: {HIDDEN_DIM}")
     print(f"BATCH_SIZE: {BATCH_SIZE}")
@@ -150,6 +176,7 @@ def main():
 
     key = jax.random.PRNGKey(args.seed)
 
+    # Initialize weights
     key, k1, k2, k3 = jax.random.split(key, 4)
     initializer = jax.nn.initializers.orthogonal()
     w1 = initializer(k1, (784, HIDDEN_DIM), jnp.float32)
@@ -159,34 +186,19 @@ def main():
     print("Training...")
     start_time = time.perf_counter()
 
-    lr = LR_START
-    sigma = SIGMA_START
-
-    for epoch in range(EPOCHS):
-        epoch_start = time.perf_counter()
-
-        # Generate B1 per epoch (outside JIT — fast, avoids adding to scan body)
-        key, b1_key, data_key = jax.random.split(key, 3)
-        B1 = jax.random.normal(b1_key, (HALF_POPULATION, 784), dtype=jnp.float32)
-        B1_f = B1.astype(jnp.bfloat16)
-
-        # Shuffle and group data
-        n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
-        perm = jax.random.permutation(data_key, X_train.shape[0])
-        X_grouped = X_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)
-        y_grouped = y_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE)
-
-        w1, w2, w3, key = train_epoch(w1, w2, w3, X_grouped, y_grouped, B1, B1_f, sigma, lr, key)
-        jax.block_until_ready(w1)
-
-        epoch_time = time.perf_counter() - epoch_start
-        print(f"Epoch {epoch+1:2d} | LR: {lr:.4f} | Sigma: {sigma:.4f} | Time: {epoch_time:.1f}s")
-
-        lr *= LR_DECAY
-        sigma *= SIGMA_DECAY
+    w1, w2, w3 = train_all_epochs(w1, w2, w3, X_train, y_train, key)
+    jax.block_until_ready(w1)
 
     train_time = time.perf_counter() - start_time
+
+    # Measure memory after training
     peak_memory = get_gpu_memory_mb()
+
+    # Print epoch info retroactively (we can't time individual epochs inside JIT)
+    for epoch in range(EPOCHS):
+        lr_e = LR_START * (LR_DECAY ** epoch)
+        sigma_e = SIGMA_START * (SIGMA_DECAY ** epoch)
+        print(f"Epoch {epoch+1:2d} | LR: {lr_e:.4f} | Sigma: {sigma_e:.4f} | Time: {train_time/EPOCHS:.1f}s")
 
     # Evaluate
     print("\nEvaluating on test set...")
@@ -206,6 +218,7 @@ def main():
     print(f"Training Time: {train_time:.2f}s")
     print(f"Peak GPU Memory: {peak_memory:.1f} MB")
 
+    # Machine-parseable results block — validate.py and benchmark.py grep this
     print("=== RESULTS ===")
     print(f"test_accuracy: {test_acc:.6f}")
     print(f"training_time_s: {train_time:.2f}")
