@@ -34,8 +34,8 @@ if not os.path.exists("mnist_prepped_float.npz"):
     exit(1)
 
 data = np.load("mnist_prepped_float.npz")
-X_train = jnp.array(data["X_train"])
-y_train = jnp.array(data["y_train"])
+X_train_np = data["X_train"]  # keep in CPU memory
+y_train_np = data["y_train"]  # keep in CPU memory
 X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
@@ -52,7 +52,7 @@ LR_DECAY = 0.92
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
-N_BATCHES = (X_train.shape[0] // BATCH_SIZE)  # drop last incomplete batch
+N_BATCHES = (X_train_np.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
 SMALL_VEC_DIM = HIDDEN_DIM * 4 + 10  # A1+B2+A2+B3+A3 = 522 (without B1)
 GROUP_SIZE = 2  # process this many batches per ES gradient step
@@ -60,7 +60,7 @@ N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 // 2 = 234 groups
 
 
 @jax.jit
-def train_all_epochs(w1, w2, w3, X_train, y_train, key):
+def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
     """Train all epochs in a single JIT call — eliminates Python loop overhead."""
 
     # Loop-invariant scalars
@@ -71,15 +71,14 @@ def train_all_epochs(w1, w2, w3, X_train, y_train, key):
         w1, w2, w3, key, sigma, lr = carry
 
         # Generate B1 ONCE per epoch (784 elements = 60% of random data)
-        key, b1_key, data_key, epoch_rng_key = jax.random.split(key, 4)
+        key, b1_key, epoch_rng_key = jax.random.split(key, 3)
         B1 = jax.random.normal(b1_key, (HALF_POPULATION, 784), dtype=jnp.float32)
         B1_f = B1.astype(jnp.bfloat16)
 
-        # Shuffle data for this epoch, grouped into chunks of GROUP_SIZE batches
-        n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
-        perm = jax.random.permutation(data_key, X_train.shape[0])
-        X_shuf = X_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)
-        y_shuf = y_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE)
+        # Use pre-grouped data directly (no per-epoch shuffling — ES doesn't need it,
+        # random perturbations provide sufficient variance)
+        X_shuf = X_grouped
+        y_shuf = y_grouped
 
         sigma_f32 = jnp.float32(sigma)
         T_f32 = jnp.float32(T)
@@ -183,10 +182,17 @@ def main():
     w2 = initializer(k2, (HIDDEN_DIM, HIDDEN_DIM), jnp.float32)
     w3 = initializer(k3, (HIDDEN_DIM, 10), jnp.float32)
 
+    # Shuffle once on CPU, group, and transfer to GPU
+    rng = np.random.default_rng(args.seed)
+    n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
+    perm = rng.permutation(X_train_np.shape[0])
+    X_grouped = jnp.array(X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1))
+    y_grouped = jnp.array(y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE))
+
     print("Training...")
     start_time = time.perf_counter()
 
-    w1, w2, w3 = train_all_epochs(w1, w2, w3, X_train, y_train, key)
+    w1, w2, w3 = train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key)
     jax.block_until_ready(w1)
 
     train_time = time.perf_counter() - start_time
