@@ -6,7 +6,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from functools import partial
-from kernels.fused_3layer_ce import fused_3layer_ce
+from kernels.fused_3layer_ce import fused_3layer_ce_both
 
 
 def fast_gelu(x):
@@ -64,8 +64,7 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
     """Train all epochs in a single JIT call — eliminates Python loop overhead."""
 
     # Loop-invariant scalars
-    pos_sign = jnp.float32(1.0)
-    neg_sign = jnp.float32(-1.0)
+    # No pos_sign/neg_sign needed — merged kernel handles both
 
     def epoch_step(carry, _):
         w1, w2, w3, key, sigma, lr = carry
@@ -109,12 +108,9 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
             base1 = xb_f @ w1_f
             xB1_T = B1_f @ xb_f.T
 
-            partial_ce_pos = fused_3layer_ce(
+            partial_ce_pos, partial_ce_neg = fused_3layer_ce_both(
                 base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
-                sigma_f32, T_f32, pos_sign, yb)
-            partial_ce_neg = fused_3layer_ce(
-                base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
-                sigma_f32, T_f32, neg_sign, yb)
+                sigma_f32, T_f32, yb)
 
             # Skip /BATCH_SIZE — normalization absorbs the constant scale
             fitness_diff = partial_ce_neg.sum(axis=1) - partial_ce_pos.sum(axis=1)
