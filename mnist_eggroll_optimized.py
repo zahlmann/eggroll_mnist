@@ -70,13 +70,8 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
     def epoch_step(carry, _):
         w1, w2, w3, key, sigma, lr = carry
 
-        # Generate B1 ONCE per epoch (784 elements = 60% of random data)
-        key, b1_key, epoch_rng_key = jax.random.split(key, 3)
-        B1 = jax.random.normal(b1_key, (HALF_POPULATION, 784), dtype=jnp.float32)
-        B1_f = B1.astype(jnp.bfloat16)
+        key, epoch_rng_key = jax.random.split(key)
 
-        # Use pre-grouped data directly (no per-epoch shuffling — ES doesn't need it,
-        # random perturbations provide sufficient variance)
         X_shuf = X_grouped
         y_shuf = y_grouped
 
@@ -88,22 +83,23 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
             w1, w2, w3, batch_idx = carry
             xb, yb = batch_data
 
-            # Generate only smaller vectors per batch (522 elements instead of 1306)
             batch_key = jax.random.fold_in(epoch_rng_key, batch_idx)
-            small_vecs = jax.random.normal(batch_key, (HALF_POPULATION, SMALL_VEC_DIM), dtype=jnp.float32)
-            small_vecs_f = small_vecs.astype(jnp.bfloat16)
+            all_vecs = jax.random.normal(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32)
+            all_vecs_f = all_vecs.astype(jnp.bfloat16)
 
-            A1_f = small_vecs_f[:, :HIDDEN_DIM]
-            B2_f = small_vecs_f[:, HIDDEN_DIM:2*HIDDEN_DIM]
-            A2_f = small_vecs_f[:, 2*HIDDEN_DIM:3*HIDDEN_DIM]
-            B3_f = small_vecs_f[:, 3*HIDDEN_DIM:4*HIDDEN_DIM]
-            A3_f = small_vecs_f[:, 4*HIDDEN_DIM:]
+            B1_f = all_vecs_f[:, :784]
+            A1_f = all_vecs_f[:, 784:784+HIDDEN_DIM]
+            B2_f = all_vecs_f[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
+            A2_f = all_vecs_f[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM]
+            B3_f = all_vecs_f[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
+            A3_f = all_vecs_f[:, 784+4*HIDDEN_DIM:]
 
-            A1 = small_vecs[:, :HIDDEN_DIM]
-            B2 = small_vecs[:, HIDDEN_DIM:2*HIDDEN_DIM]
-            A2 = small_vecs[:, 2*HIDDEN_DIM:3*HIDDEN_DIM]
-            B3 = small_vecs[:, 3*HIDDEN_DIM:4*HIDDEN_DIM]
-            A3 = small_vecs[:, 4*HIDDEN_DIM:]
+            B1 = all_vecs[:, :784]
+            A1 = all_vecs[:, 784:784+HIDDEN_DIM]
+            B2 = all_vecs[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
+            A2 = all_vecs[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM]
+            B3 = all_vecs[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
+            A3 = all_vecs[:, 784+4*HIDDEN_DIM:]
 
             xb_f = xb.astype(jnp.bfloat16)
             w1_f = w1.astype(jnp.bfloat16)
