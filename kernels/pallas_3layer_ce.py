@@ -44,20 +44,25 @@ def _pallas_3layer_ce_kernel(
 
     xB1_col = xB1_T_ref[0, :].astype(jnp.float32)
 
-    # ── L1 forward + L2 matmul (no K-tiling for debugging) ──────
-    base1_full = base1_ref[:, :].astype(jnp.float32)
-    A1_full = A1_ref[0, :].astype(jnp.float32)
+    # ── K-tiled L1 forward + L2 matmul ──────────────────────────
+    base2 = jnp.zeros((BLOCK_B, HIDDEN), dtype=jnp.float32)
+    xB2 = jnp.zeros((BLOCK_B,), dtype=jnp.float32)
 
-    pre_act = base1_full + sign_sigma * xB1_col[:, None] * A1_full[None, :]
-    l1 = pre_act * jax.nn.sigmoid(1.702 * pre_act)
+    for k in range(0, HIDDEN, BLOCK_K):
+        base1_k = base1_ref[:, k:k+BLOCK_K].astype(jnp.float32)
+        A1_k = A1_ref[0, k:k+BLOCK_K].astype(jnp.float32)
 
-    base2 = pl.dot(
-        l1.astype(jnp.bfloat16),
-        w2_ref[:, :].astype(jnp.bfloat16),
-    ).astype(jnp.float32)
+        pre_act = base1_k + sign_sigma * xB1_col[:, None] * A1_k[None, :]
+        l1_k = pre_act * jax.nn.sigmoid(1.702 * pre_act)
 
-    B2_full = B2_ref[0, :].astype(jnp.float32)
-    xB2 = jnp.sum(l1 * B2_full[None, :], axis=1)
+        w2_k = w2_ref[k:k+BLOCK_K, :]
+        base2 = base2 + pl.dot(
+            l1_k.astype(jnp.float8_e4m3fn),
+            w2_k.astype(jnp.float8_e4m3fn),
+        ).astype(jnp.float32)
+
+        B2_k = B2_ref[0, k:k+BLOCK_K].astype(jnp.float32)
+        xB2 = xB2 + jnp.sum(l1_k * B2_k[None, :], axis=1)
 
     # ── L2 activation ────────────────────────────────────────────
     A2_row = A2_ref[0, :].astype(jnp.float32)
@@ -67,8 +72,8 @@ def _pallas_3layer_ce_kernel(
     # ── Layer 3 (FP8) ────────────────────────────────────────────
     w3 = w3_ref[:, :]
     base3 = pl.dot(
-        l2.astype(jnp.bfloat16),
-        w3.astype(jnp.bfloat16),
+        l2.astype(jnp.float8_e4m3fn),
+        w3.astype(jnp.float8_e4m3fn),
     ).astype(jnp.float32)
 
     B3_row = B3_ref[0, :].astype(jnp.float32)
