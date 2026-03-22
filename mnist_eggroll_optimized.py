@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault('TRITON_CACHE_DIR', '/tmp/triton_cache')
 import sys
 import time
 import argparse
@@ -8,8 +9,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Import the Triton kernel (same @triton.jit kernel works with PyTorch)
-from kernels.fused_3layer_ce import _fused_3layer_ce_both_kernel
+from kernels.torch_3layer_ce import _fused_3layer_ce_both_kernel
 
 
 def fast_gelu(x):
