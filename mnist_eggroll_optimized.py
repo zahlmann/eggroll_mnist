@@ -47,7 +47,7 @@ EPOCHS = 10
 T = 2.0  # temperature for CE fitness (T>1 softens logits → smoother ES gradients)
 
 # ---- Tunable hyperparameters (agent may adjust these) ----
-LR_START = 0.015
+LR_START = 0.016
 LR_DECAY = 0.92
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
@@ -83,7 +83,8 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
             xb, yb = batch_data
 
             batch_key = jax.random.fold_in(epoch_rng_key, batch_idx)
-            all_vecs = jax.random.normal(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32)
+            # Uniform[-sqrt(3), sqrt(3)] has variance=1 like N(0,1) but simpler XLA graph
+            all_vecs = jax.random.uniform(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32, minval=-1.7320508, maxval=1.7320508)
             all_vecs_f = all_vecs.astype(jnp.bfloat16)
 
             B1_f = all_vecs_f[:, :784]
