@@ -64,6 +64,9 @@ Also forbidden:
 - Changing the dataset or data loading
 - Modifying `validate.py` or `benchmark.py`
 - Installing packages not already in `pyproject.toml` (you may add triton/jax-triton)
+- **Changing the framework** (e.g., rewriting in PyTorch). Both EGGROLL and the backprop
+  baseline must use JAX. A PyTorch EGGROLL at 4.2s vs JAX backprop at 4.7s is NOT a
+  fair comparison — PyTorch backprop runs in 1.1s, making EGGROLL 3.8× slower.
 
 ## Fairness Rules (catch yourself on these)
 
@@ -260,10 +263,14 @@ Check `nvidia-smi` — if another process is using the GPU, numbers will be infl
 - **BLOCK_B=32**: higher occupancy (6 blocks/SM) doesn't compensate for 33% more waves.
 - **BLOCK_B=128**: register pressure kills occupancy (2 blocks/SM).
 - **BLOCK_K=64**: larger K-tiles increase register pressure even with num_stages=1.
+- **BLOCK_K=16**: FP8 tensor cores require K≥32 — crashes.
 - **num_stages=4**: more pipeline stages consume more registers, reducing occupancy.
+- **num_stages=2**: 6.0s — still adds register pressure from prefetch buffers.
 - **num_warps=8**: with BLOCK_B=64, per-epoch compute 25% slower (register spilling).
 - **num_warps=2**: worse occupancy than num_warps=4.
 - **bf16 instead of fp8 matmuls**: 5.94s — FP8 tensor cores are essential (2× throughput).
+- **maxnreg=96/80** (via @triton.autotune Config): no effect — either jax-triton
+  doesn't pass maxnreg through, or the register spills offset occupancy gains.
 
 ### Kernel restructuring
 - **Doubly-tiled J+K kernel**: tiling L2 output dimension (BLOCK_J=32) reduces the
@@ -271,6 +278,12 @@ Check `nvidia-smi` — if another process is using the GPU, numbers will be infl
   than the occupancy gain (0.7s/epoch vs 0.4s).
 - **Fusing xB1_T into Triton kernel**: 10.8s — computing B1·xb dot products per-block
   is 2× slower than cuBLAS doing the full matmul.
+- **Fused pos/neg in single block**: 6.74s — compute both signs sequentially in one
+  block (halves grid to 10K). The doubled compute per block + register pressure from
+  code duplication outweighs L2 cache reuse of shared data.
+- **Packed perturbation vectors** (single stride-1306 tensor): 6.20s — passing all_vecs_f
+  as one tensor instead of 5 separate slices. Stride-1306 access pattern is worse than
+  stride-128 for individual slices, negating any argument-count reduction benefit.
 
 ### Random generation
 - **Separate Triton RNG kernel** (replacing jax.random.normal): Triton compile
@@ -280,12 +293,17 @@ Check `nvidia-smi` — if another process is using the GPU, numbers will be infl
 - **Separate vector generation** (6 jax.random.normal calls instead of 1): 6.2s,
   significantly slower due to extra key splitting and PRNG overhead.
 - **unsafe_rbg PRNG**: lower randomness quality dropped accuracy below threshold.
+- **rbg PRNG** (jax_default_prng_impl="rbg"): 6.12s — slower than threefry, not faster.
+- **Counter-based PRNG** (SplitMix32 hash + Box-Muller): 5.88s, 97.72% acc — eliminates
+  threefry from HLO (~30 ops vs ~338) but no JIT speedup. PRNG HLO ops are NOT the
+  compilation bottleneck — the jax-triton bridge serialization dominates.
 
 ### Algorithmic changes (tried and reverted for fairness or accuracy)
 - **Rademacher perturbations** (random ±1): 5.89s but accuracy drops to 97.1% on
   some seeds. Noisier than Gaussian.
-- **Uniform perturbations** (uniform[-sqrt(3), sqrt(3)]): saves ~0.1s compilation
-  but accuracy margin too thin without other changes.
+- **Uniform perturbations** (uniform[-sqrt(3), sqrt(3)]): 5.70s (saves ~0.1s) but
+  avg accuracy 97.18% across 3 seeds fails validation (seed 7: 97.03%). Tuning
+  LR_DECAY=0.92 and SIGMA_START=0.032 didn't help.
 - **Epoch-level RNG (all vectors)**: 5.71s but accuracy collapses to 96.5% — only
   5000 perturbation directions per epoch is not enough diversity.
 - **Epoch-level B1 only**: marginal accuracy improvement but no speed gain.
@@ -306,50 +324,95 @@ Check `nvidia-smi` — if another process is using the GPU, numbers will be infl
 - **Flat single scan (2340 iters)**: tiling data 10× blows up memory to 2GB.
 - **Pre-cast xb to bf16 in epoch body**: no improvement, XLA already fuses the cast.
 - **Per-epoch JIT (instead of all-in-one)**: 5.8s time but 750MB memory — over limit.
+- **fori_loop instead of scan** for batch loop: 5.81s — identical. JAX compiles both
+  to the same while_loop + dynamic_slice pattern internally.
+- **donate_argnums** for buffer reuse: 5.87s — no effect. XLA already optimizes
+  buffer reuse within the scan.
+- **XLA_FLAGS** (latency_hiding_scheduler=false, command_buffer=, etc.): 5.78-5.91s
+  — all within noise. No XLA flag significantly reduces compilation time.
 
-### JIT profiling results
-The 2.3s JIT breaks down as: lowering (tracing) 0.89s + XLA compilation 1.38s +
-Triton kernel compile 0.11s. The HLO graph has ~1270 ops, of which 338 (27%) are
-threefry PRNG bit operations (xor, shift, or, add). The PRNG structure dominates
-the XLA graph even though it processes data efficiently at runtime.
+### Pallas kernels (JAX native)
+- **Pallas 3-layer fused CE kernel**: JIT 1.96s (saves 0.33s vs Triton 2.29s) but
+  execution 4.68s (loses 1.42s vs Triton 3.26s). Pallas auto-generates Triton code
+  that can't match the hand-tuned register/tiling optimizations. Net: 6.73s — worse.
+- Key finding: Pallas JIT is 10× faster than jax-triton for simple kernels (0.064s
+  vs 0.661s), but for complex kernels the savings are only 0.33s because the Pallas
+  → Triton code generation itself takes time.
+- Pallas `index_map` returns BLOCK INDICES (multiplied by block_shape automatically),
+  NOT element indices. Using `i * BLOCK_B` double-counts — a common gotcha.
 
-## Time budget breakdown (where 5.8s goes)
+### JIT profiling results (Session 4 — more accurate)
+The 2.4s JIT breaks down as measured by comparing first-call vs second-call times:
+- **With Triton kernel**: first=5.55s, exec=3.26s, JIT=2.29s
+- **Without Triton (dummy zeros)**: first=1.66s, exec=0.45s, JIT=1.21s
+- **Triton JIT overhead**: 2.29 - 1.21 = **1.07s** — almost half the JIT!
+  This is dominated by jax-triton serialization (0.89s lowering), not PTX generation.
 
+The earlier estimate (lowering 0.89s + XLA 1.38s + Triton 0.11s) attributed too
+much to XLA compilation. In reality, removing the Triton kernel from the scan body
+drops JIT from 2.29s to 1.21s — the Triton bridge is the single largest JIT cost.
+
+The HLO graph has ~1270 ops, of which 338 (27%) are threefry PRNG bit operations,
+but replacing PRNG with counter-based hashing (~30 ops) didn't reduce JIT. The
+PRNG ops are NOT the compilation bottleneck.
+
+## Time budget breakdown (where 5.8s goes) — verified Session 4
+
+### JIT breakdown (2.39s total)
 | Component | Time | Notes |
 |-----------|------|-------|
-| JAX lowering | 0.89s | Tracing Python → XLA HLO, includes jax-triton serialization |
-| XLA compilation | 1.38s | Optimizing nested scan HLO graph (~1270 ops, 27% PRNG) |
-| Triton kernel compile | 0.11s | First-call PTX generation for the fused forward kernel |
-| Triton kernel (×1 per batch) | ~2.1s | 20K blocks × 1 merged call × 468 batches × 10 epochs |
-| Random gen + casts | ~0.4s | jax.random.normal (5000×1306) + bf16 cast, 468 batches × 10 epochs |
-| Gradient matmuls | ~0.3s | B.T @ (shaped * A) for 3 layers, fp32, 468 batches × 10 epochs |
-| Data shuffle + other | ~0.6s | CPU shuffle, weight updates, scan overhead |
+| Non-Triton JIT | 1.21s | XLA compilation of scan body without kernel (PRNG + matmuls + gradient) |
+| Triton JIT overhead | 1.07s | jax-triton serialization + XLA handling of custom_call |
+| (Triton PTX gen) | 0.11s | (subset of above: just the PTX compilation) |
 
-To reach 5s: need to save ~0.8s. The XLA JIT (2.4s) is the dominant cost.
+### Execution breakdown (3.28s total, measured by comparing full vs no-kernel runs)
+| Component | Time | % of exec | Notes |
+|-----------|------|-----------|-------|
+| Triton kernel + setup | 2.82s | 86% | Includes bf16 casts, base1/xB1_T matmuls, kernel launch |
+| Random generation | 0.13s | 4% | jax.random.normal (5000×1306) + bf16 cast per batch |
+| Gradient matmuls + updates | 0.31s | 10% | B.T @ (shaped * A) for 3 layers + weight updates |
+
+### Other
+| Component | Time | Notes |
+|-----------|------|-------|
+| CPU shuffle + GPU transfer | ~0.13s | Included in training_time_s, before JIT |
+
+The kernel achieves only ~12% of FP8 peak throughput (81 TFLOPS / 660 TFLOPS theoretical)
+due to 25% occupancy (4 blocks/SM, limited by ~113 registers/thread).
+
+To reach 5s: need to save ~0.8s. The jax-triton bridge (1.07s) is the single largest
+reducible cost, but Pallas can't replace it without losing kernel quality.
+
+### PyTorch rewrite (tested Session 4, ruled unfair)
+A full PyTorch + Triton rewrite was tested. Results:
+- PyTorch EGGROLL: **4.2s**, 97.4% acc, 292MB — target reached
+- But PyTorch backprop: **1.1s**, 97.3% acc — EGGROLL is 3.8× slower
+- JAX backprop: **4.6s** — most of this is JIT overhead, not compute
+
+The PyTorch rewrite eliminates JAX's 2.4s JIT but gives the same advantage to backprop.
+Comparing PyTorch EGGROLL (4.2s) vs JAX backprop (4.6s) is misleading. This approach
+is now explicitly forbidden in the rules above.
 
 ## Ideas to try next
 
-### Most promising
-1. **Reduce XLA compilation of PRNG**: the threefry PRNG accounts for 27% of the
-   HLO graph. Finding a way to simplify it (different PRNG, or moving it out of the
-   inner scan body) would reduce compilation. CAUTION: epoch-level RNG kills accuracy;
-   tl.randn is too slow; separate Triton RNG kernel is neutral. A new approach is needed.
-2. **Pallas kernels**: JAX's native kernel language compiles as part of XLA, potentially
-   eliminating the jax-triton custom_call overhead in lowering (~0.89s). BUT: Pallas
-   uses Triton as GPU backend, so savings may be zero. Worth testing.
-3. **Reduce kernel register pressure**: the forward kernel uses ~113 regs/thread giving
-   only 25% occupancy (4 blocks/SM). Getting to 6+ blocks/SM would speed up compute.
-   The base2 accumulator (64×128 fp32 = 64 regs/thread) is the biggest hog. Ideas:
-   - Store partial accumulators in shared memory between J-tiles (avoids GELU recompute)
-   - Use bf16 accumulation for L2 matmul (risky for accuracy)
-   - Find a tiling that reduces accumulator size without recompute penalty
+### Remaining ideas (within JAX)
+1. **Write the kernel in raw CUDA/PTX** and call via JAX's FFI instead of jax-triton.
+   This would bypass the jax-triton serialization overhead (1.07s) while keeping the
+   hand-tuned kernel quality. Very complex to implement.
+2. **Persistent Triton kernel**: keep blocks resident on SMs across batches, computing
+   multiple batch steps per block launch. Would amortize kernel launch overhead and
+   potentially improve L2 cache reuse for weights. Requires restructuring the grid to
+   be batch-aware.
 
-### Other ideas
-4. **CUDA Graphs via JAX**: capture the training loop as a CUDA graph to eliminate
-   per-kernel launch overhead. JAX has experimental support.
-5. **Overlap computation**: overlap PRNG generation with previous batch's gradient
-   computation using async execution.
-6. **Persistent kernels**: keep blocks resident on SMs across batches, amortizing
-   weight loads (w2, w3 are shared across all population members).
-7. **PyTorch + Triton rewrite**: eliminates JAX's XLA JIT entirely (~2.4s savings).
-   Would immediately reach ~3.4s but requires adding torch to pyproject.toml.
+### Ideas that are exhausted or have known blockers
+- ~~PyTorch rewrite~~: 4.2s EGGROLL but unfair comparison (PyTorch backprop = 1.1s)
+- ~~Reduce PRNG HLO ops~~: tried counter-based PRNG, didn't reduce JIT (bridge, not PRNG,
+  is the bottleneck)
+- ~~Pallas kernels~~: 10× faster JIT for simple kernels but auto-generated Triton code
+  is 44% slower at execution. Net worse.
+- ~~Reduce kernel register pressure via maxnreg~~: either not passed through jax-triton
+  or spills offset gains
+- ~~Kernel restructuring (fused pos/neg, packed vectors)~~: all made performance worse
+- ~~Alternative loop structures (fori_loop, while_loop)~~: identical to scan
+- ~~XLA flags, donate_argnums~~: no effect
+- ~~Uniform perturbations~~: 0.1s faster but fails accuracy validation
