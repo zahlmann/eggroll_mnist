@@ -47,16 +47,16 @@ EPOCHS = 10
 T = 2.0  # temperature for CE fitness (T>1 softens logits → smoother ES gradients)
 
 # ---- Tunable hyperparameters (agent may adjust these) ----
-LR_START = 0.015
-LR_DECAY = 0.92
+LR_START = 0.022
+LR_DECAY = 0.95
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
 N_BATCHES = (X_train_np.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
 SMALL_VEC_DIM = HIDDEN_DIM * 4 + 10  # A1+B2+A2+B3+A3 = 522 (without B1)
-GROUP_SIZE = 2  # process this many batches per ES gradient step
-N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 // 2 = 234 groups
+GROUP_SIZE = 3  # process this many batches per ES gradient step
+N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 // 3 = 156 groups
 
 
 @jax.jit
