@@ -64,6 +64,9 @@ Also forbidden:
 - Changing the dataset or data loading
 - Modifying `validate.py` or `benchmark.py`
 - Installing packages not already in `pyproject.toml` (you may add triton/jax-triton)
+- **Changing the framework** (e.g., rewriting in PyTorch). Both EGGROLL and the backprop
+  baseline must use JAX. A PyTorch EGGROLL at 4.2s vs JAX backprop at 4.7s is NOT a
+  fair comparison — PyTorch backprop runs in 1.1s, making EGGROLL 3.8× slower.
 
 ## Fairness Rules (catch yourself on these)
 
@@ -380,21 +383,29 @@ due to 25% occupancy (4 blocks/SM, limited by ~113 registers/thread).
 To reach 5s: need to save ~0.8s. The jax-triton bridge (1.07s) is the single largest
 reducible cost, but Pallas can't replace it without losing kernel quality.
 
+### PyTorch rewrite (tested Session 4, ruled unfair)
+A full PyTorch + Triton rewrite was tested. Results:
+- PyTorch EGGROLL: **4.2s**, 97.4% acc, 292MB — target reached
+- But PyTorch backprop: **1.1s**, 97.3% acc — EGGROLL is 3.8× slower
+- JAX backprop: **4.6s** — most of this is JIT overhead, not compute
+
+The PyTorch rewrite eliminates JAX's 2.4s JIT but gives the same advantage to backprop.
+Comparing PyTorch EGGROLL (4.2s) vs JAX backprop (4.6s) is misleading. This approach
+is now explicitly forbidden in the rules above.
+
 ## Ideas to try next
 
-### What could actually work (requires significant effort)
-1. **PyTorch + Triton rewrite**: eliminates JAX's XLA JIT entirely (~2.4s savings).
-   Would immediately reach ~3.4s. Requires adding torch to pyproject.toml — currently
-   forbidden by the rules, but is the only path to significant improvement.
-2. **Write the kernel in raw CUDA/PTX** and call via JAX's FFI instead of jax-triton.
+### Remaining ideas (within JAX)
+1. **Write the kernel in raw CUDA/PTX** and call via JAX's FFI instead of jax-triton.
    This would bypass the jax-triton serialization overhead (1.07s) while keeping the
    hand-tuned kernel quality. Very complex to implement.
-3. **Persistent Triton kernel**: keep blocks resident on SMs across batches, computing
+2. **Persistent Triton kernel**: keep blocks resident on SMs across batches, computing
    multiple batch steps per block launch. Would amortize kernel launch overhead and
    potentially improve L2 cache reuse for weights. Requires restructuring the grid to
    be batch-aware.
 
 ### Ideas that are exhausted or have known blockers
+- ~~PyTorch rewrite~~: 4.2s EGGROLL but unfair comparison (PyTorch backprop = 1.1s)
 - ~~Reduce PRNG HLO ops~~: tried counter-based PRNG, didn't reduce JIT (bridge, not PRNG,
   is the bottleneck)
 - ~~Pallas kernels~~: 10× faster JIT for simple kernels but auto-generated Triton code
