@@ -3,28 +3,24 @@ import sys
 import time
 import argparse
 import numpy as np
-import jax
-import jax.numpy as jnp
-from functools import partial
-from kernels.fused_3layer_ce import fused_3layer_ce_both
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+# Import the Triton kernel (same @triton.jit kernel works with PyTorch)
+from kernels.fused_3layer_ce import _fused_3layer_ce_both_kernel
 
 
 def fast_gelu(x):
-    """Sigmoid-based GELU approximation (GPT-2 style). Fewer FLOPs, simpler for XLA to fuse."""
-    return x * jax.nn.sigmoid(1.702 * x)
+    """Sigmoid-based GELU approximation (GPT-2 style)."""
+    return x * torch.sigmoid(1.702 * x)
+
 
 def get_gpu_memory_mb():
     """Get peak GPU memory usage in MB."""
-    try:
-        devices = jax.devices('gpu')
-        if devices:
-            jax.block_until_ready(jnp.zeros(1))
-            stats = devices[0].memory_stats()
-            if stats:
-                # Use peak_bytes_in_use to catch transient allocations during training
-                return stats.get('peak_bytes_in_use', stats.get('bytes_in_use', 0)) / (1024 * 1024)
-    except:
-        pass
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / (1024 * 1024)
     return 0.0
 
 
@@ -34,17 +30,17 @@ if not os.path.exists("mnist_prepped_float.npz"):
     exit(1)
 
 data = np.load("mnist_prepped_float.npz")
-X_train_np = data["X_train"]  # keep in CPU memory
-y_train_np = data["y_train"]  # keep in CPU memory
-X_test = jnp.array(data["X_test"])
-y_test = jnp.array(data["y_test"])
+X_train_np = data["X_train"]
+y_train_np = data["y_train"]
+X_test_np = data["X_test"]
+y_test_np = data["y_test"]
 
 # ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
 HALF_POPULATION = 5000
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
-T = 2.0  # temperature for CE fitness (T>1 softens logits → smoother ES gradients)
+T = 2.0
 
 # ---- Tunable hyperparameters (agent may adjust these) ----
 LR_START = 0.012
@@ -52,39 +48,109 @@ LR_DECAY = 0.88
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
-N_BATCHES = (X_train_np.shape[0] // BATCH_SIZE)  # drop last incomplete batch
-VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
+N_BATCHES = X_train_np.shape[0] // BATCH_SIZE
+VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # 1306
 
-GROUP_SIZE = 1  # each ES gradient step uses one batch (fair: same as backprop baseline)
-N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 groups
+GROUP_SIZE = 1
+N_GROUPS = N_BATCHES // GROUP_SIZE  # 468
+
+DEVICE = 'cuda'
+OUT_DIM = 10
+OUT_DIM_PAD = 16
+BLOCK_B = 64
+BLOCK_K = 32
 
 
-@jax.jit
-def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
-    """Train all epochs in a single JIT call — eliminates Python loop overhead."""
+def fused_3layer_ce_both(base1, xB1_T, A1, w2, B2, A2, w3_pad, B3, A3_pad,
+                         sigma, T_val, y):
+    """Launch the Triton kernel for both pos and neg CE."""
+    HALF_POP = xB1_T.shape[0]
+    BATCH = xB1_T.shape[1]
+    HIDDEN = base1.shape[1]
+    N_TILES = triton.cdiv(BATCH, BLOCK_B)
 
-    # Loop-invariant scalars
-    # No pos_sign/neg_sign needed — merged kernel handles both
+    # Scalar tensors for kernel
+    sigma_t = torch.tensor([sigma], dtype=torch.float32, device=DEVICE)
+    T_t = torch.tensor([T_val], dtype=torch.float32, device=DEVICE)
 
-    def epoch_step(carry, _):
-        w1, w2, w3, key, sigma, lr = carry
+    # Pre-allocate outputs
+    partial_ce_pos = torch.empty((HALF_POP, N_TILES), dtype=torch.float32, device=DEVICE)
+    partial_ce_neg = torch.empty((HALF_POP, N_TILES), dtype=torch.float32, device=DEVICE)
 
-        key, epoch_rng_key = jax.random.split(key)
+    grid = (HALF_POP, N_TILES, 2)
+    _fused_3layer_ce_both_kernel[grid](
+        base1, xB1_T, A1,
+        w2, B2, A2,
+        w3_pad, B3, A3_pad,
+        sigma_t, T_t,
+        y,
+        partial_ce_pos, partial_ce_neg,
+        HALF_POP=HALF_POP, BATCH=BATCH, HIDDEN=HIDDEN,
+        OUT_DIM=OUT_DIM, OUT_DIM_PAD=OUT_DIM_PAD,
+        BLOCK_B=BLOCK_B, BLOCK_K=BLOCK_K, N_TILES=N_TILES,
+        num_warps=4, num_stages=1,
+    )
+    return partial_ce_pos, partial_ce_neg
 
-        X_shuf = X_grouped
-        y_shuf = y_grouped
 
-        sigma_f32 = jnp.float32(sigma)
-        T_f32 = jnp.float32(T)
-        scale = jnp.float32(1.0) / (jnp.float32(2.0) * sigma_f32 * jnp.float32(HALF_POPULATION))
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=11)
+    args = parser.parse_args()
 
-        def batch_step(carry, batch_data):
-            w1, w2, w3, batch_idx = carry
-            xb, yb = batch_data
+    print("=== CONSTANTS ===")
+    print(f"HIDDEN_DIM: {HIDDEN_DIM}")
+    print(f"BATCH_SIZE: {BATCH_SIZE}")
+    print(f"EPOCHS: {EPOCHS}")
+    print(f"HALF_POPULATION: {HALF_POPULATION}")
+    print(f"T: {T}")
+    print(f"SEED: {args.seed}")
+    print("=================")
 
-            batch_key = jax.random.fold_in(epoch_rng_key, batch_idx)
-            all_vecs = jax.random.uniform(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32, minval=-1.7320508, maxval=1.7320508)
-            all_vecs_f = all_vecs.astype(jnp.bfloat16)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+
+    # Initialize weights (orthogonal)
+    w1 = torch.empty(784, HIDDEN_DIM, dtype=torch.float32, device=DEVICE)
+    w2 = torch.empty(HIDDEN_DIM, HIDDEN_DIM, dtype=torch.float32, device=DEVICE)
+    w3 = torch.empty(HIDDEN_DIM, 10, dtype=torch.float32, device=DEVICE)
+    torch.nn.init.orthogonal_(w1)
+    torch.nn.init.orthogonal_(w2)
+    torch.nn.init.orthogonal_(w3)
+
+    # Pad w3 and prepare for kernel
+    w3_pad = F.pad(w3, (0, OUT_DIM_PAD - OUT_DIM))  # (128, 16)
+
+    print("Training...")
+    torch.cuda.reset_peak_memory_stats()
+    start_time = time.perf_counter()
+
+    # Shuffle once on CPU, group, transfer to GPU (included in timing)
+    rng = np.random.default_rng(args.seed)
+    n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
+    perm = rng.permutation(X_train_np.shape[0])
+    X_shuf = torch.tensor(
+        X_train_np[perm[:n_samples]].reshape(N_GROUPS, BATCH_SIZE, -1),
+        dtype=torch.float32, device=DEVICE
+    )
+    y_shuf = torch.tensor(
+        y_train_np[perm[:n_samples]].reshape(N_GROUPS, BATCH_SIZE),
+        dtype=torch.int32, device=DEVICE
+    )
+
+    sigma = SIGMA_START
+    lr = LR_START
+
+    for epoch in range(EPOCHS):
+        scale = 1.0 / (2.0 * sigma * HALF_POPULATION)
+
+        for batch_idx in range(N_GROUPS):
+            xb = X_shuf[batch_idx]  # (128, 784)
+            yb = y_shuf[batch_idx]  # (128,)
+
+            # Generate random perturbation vectors
+            all_vecs = torch.randn(HALF_POPULATION, VEC_DIM, dtype=torch.float32, device=DEVICE)
+            all_vecs_f = all_vecs.to(torch.bfloat16)
 
             B1_f = all_vecs_f[:, :784]
             A1_f = all_vecs_f[:, 784:784+HIDDEN_DIM]
@@ -100,99 +166,43 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
             B3 = all_vecs[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
             A3 = all_vecs[:, 784+4*HIDDEN_DIM:]
 
-            xb_f = xb.astype(jnp.bfloat16)
-            w1_f = w1.astype(jnp.bfloat16)
-            w2_f = w2.astype(jnp.bfloat16)
-            w3_f = w3.astype(jnp.bfloat16)
+            xb_f = xb.to(torch.bfloat16)
+            w1_f = w1.to(torch.bfloat16)
+            w2_f = w2.to(torch.bfloat16)
 
-            base1 = xb_f @ w1_f
-            xB1_T = B1_f @ xb_f.T
+            base1 = xb_f @ w1_f          # (128, 128) bf16
+            xB1_T = B1_f @ xb_f.T        # (5000, 128) bf16
+
+            A3_pad = F.pad(A3_f, (0, OUT_DIM_PAD - OUT_DIM))
 
             partial_ce_pos, partial_ce_neg = fused_3layer_ce_both(
-                base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
-                sigma_f32, T_f32, yb)
+                base1, xB1_T, A1_f, w2_f, B2_f, A2_f,
+                w3_pad.to(torch.bfloat16), B3_f, A3_pad,
+                sigma, T, yb)
 
-            # Skip /BATCH_SIZE — normalization absorbs the constant scale
-            fitness_diff = partial_ce_neg.sum(axis=1) - partial_ce_pos.sum(axis=1)
+            fitness_diff = partial_ce_neg.sum(dim=1) - partial_ce_pos.sum(dim=1)
             mean = fitness_diff.mean()
             std = fitness_diff.std() + 1e-8
             shaped = (fitness_diff - mean) / std
 
-            shaped_col = shaped[:, None]
-            grad1 = scale * B1.T @ (shaped_col * A1)
-            grad2 = scale * B2.T @ (shaped_col * A2)
-            grad3 = scale * B3.T @ (shaped_col * A3)
+            shaped_col = shaped.unsqueeze(1)
+            grad1 = scale * (B1.T @ (shaped_col * A1))
+            grad2 = scale * (B2.T @ (shaped_col * A2))
+            grad3 = scale * (B3.T @ (shaped_col * A3))
 
             w1 = w1 + lr * grad1
             w2 = w2 + lr * grad2
             w3 = w3 + lr * grad3
+            w3_pad = F.pad(w3, (0, OUT_DIM_PAD - OUT_DIM))
 
-            return (w1, w2, w3, batch_idx + 1), None
+        sigma *= SIGMA_DECAY
+        lr *= LR_DECAY
 
-        (w1, w2, w3, _), _ = jax.lax.scan(batch_step, (w1, w2, w3, jnp.int32(0)), (X_shuf, y_shuf))
-
-        sigma = sigma * SIGMA_DECAY
-        lr = lr * LR_DECAY
-
-        return (w1, w2, w3, key, sigma, lr), None
-
-    init = (w1, w2, w3, key, jnp.float32(SIGMA_START), jnp.float32(LR_START))
-    (w1, w2, w3, key, _, _), _ = jax.lax.scan(epoch_step, init, None, length=EPOCHS)
-    return w1, w2, w3
-
-
-@jax.jit
-def evaluate_batch(w1, w2, w3, xb, yb):
-    l1 = fast_gelu(xb @ w1)
-    l2 = fast_gelu(l1 @ w2)
-    logits = l2 @ w3
-    preds = jnp.argmax(logits, axis=1)
-    return jnp.mean(preds == yb)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=11)
-    args = parser.parse_args()
-
-    # Print locked constants — validate.py parses this block
-    print("=== CONSTANTS ===")
-    print(f"HIDDEN_DIM: {HIDDEN_DIM}")
-    print(f"BATCH_SIZE: {BATCH_SIZE}")
-    print(f"EPOCHS: {EPOCHS}")
-    print(f"HALF_POPULATION: {HALF_POPULATION}")
-    print(f"T: {T}")
-    print(f"SEED: {args.seed}")
-    print("=================")
-
-    key = jax.random.PRNGKey(args.seed)
-
-    # Initialize weights
-    key, k1, k2, k3 = jax.random.split(key, 4)
-    initializer = jax.nn.initializers.orthogonal()
-    w1 = initializer(k1, (784, HIDDEN_DIM), jnp.float32)
-    w2 = initializer(k2, (HIDDEN_DIM, HIDDEN_DIM), jnp.float32)
-    w3 = initializer(k3, (HIDDEN_DIM, 10), jnp.float32)
-
-    print("Training...")
-    start_time = time.perf_counter()
-
-    # Shuffle once on CPU, group, and transfer to GPU (included in timing)
-    rng = np.random.default_rng(args.seed)
-    n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
-    perm = rng.permutation(X_train_np.shape[0])
-    X_grouped = jnp.array(X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1))
-    y_grouped = jnp.array(y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE))
-
-    w1, w2, w3 = train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key)
-    jax.block_until_ready(w1)
-
+    torch.cuda.synchronize()
     train_time = time.perf_counter() - start_time
 
-    # Measure memory after training
     peak_memory = get_gpu_memory_mb()
 
-    # Print epoch info retroactively (we can't time individual epochs inside JIT)
     for epoch in range(EPOCHS):
         lr_e = LR_START * (LR_DECAY ** epoch)
         sigma_e = SIGMA_START * (SIGMA_DECAY ** epoch)
@@ -200,23 +210,29 @@ def main():
 
     # Evaluate
     print("\nEvaluating on test set...")
+    X_test = torch.tensor(X_test_np, dtype=torch.float32, device=DEVICE)
+    y_test = torch.tensor(y_test_np, dtype=torch.int64, device=DEVICE)
+
     correct = 0
     total = 0
-    for i in range(0, X_test.shape[0], 256):
-        xb = X_test[i:i+256]
-        yb = y_test[i:i+256]
-        acc = evaluate_batch(w1, w2, w3, xb, yb)
-        correct += float(acc) * len(yb)
-        total += len(yb)
+    with torch.no_grad():
+        for i in range(0, X_test.shape[0], 256):
+            xb = X_test[i:i+256]
+            yb = y_test[i:i+256]
+            l1 = fast_gelu(xb @ w1)
+            l2 = fast_gelu(l1 @ w2)
+            logits = l2 @ w3
+            preds = logits.argmax(dim=1)
+            correct += (preds == yb).sum().item()
+            total += len(yb)
 
     test_acc = correct / total
 
     print()
-    print(f"Test Accuracy: {test_acc:.2%} ({int(test_acc * total)}/{total})")
+    print(f"Test Accuracy: {test_acc:.2%} ({correct}/{total})")
     print(f"Training Time: {train_time:.2f}s")
     print(f"Peak GPU Memory: {peak_memory:.1f} MB")
 
-    # Machine-parseable results block — validate.py and benchmark.py grep this
     print("=== RESULTS ===")
     print(f"test_accuracy: {test_acc:.6f}")
     print(f"training_time_s: {train_time:.2f}")
