@@ -123,5 +123,5 @@ def fused_3layer_ce(base1, xB1_T, A1, w2, B2, A2, w3, B3, A3, sigma, T_val, sign
         HALF_POP=HALF_POP, BATCH=BATCH, HIDDEN=HIDDEN,
         OUT_DIM=OUT_DIM, OUT_DIM_PAD=OUT_DIM_PAD,
         BLOCK_B=BLOCK_B, BLOCK_K=BLOCK_K, N_TILES=N_TILES,
-        num_warps=4, num_stages=2,
+        num_warps=4, num_stages=1,
     )

@@ -216,6 +216,8 @@ multi-output kernels. Critical: argument order to triton_call is
 Both EGGROLL and backprop must use **fp32 data** for a fair comparison. The forward
 pass may use bf16 matmuls internally (JAX does this automatically via tensor cores),
 but training data (`X_train`) and perturbation vectors must be generated in fp32.
+Gradient computation must also use fp32 perturbation vectors — do NOT substitute
+bf16 vectors for the gradient matmuls (`B.T @ (shaped * A)`).
 No bf16 data loading tricks — the comparison must be apples-to-apples.
 
 ## Reference Numbers (uncontended GPU, RTX 4080 SUPER)
