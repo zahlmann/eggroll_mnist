@@ -47,15 +47,16 @@ EPOCHS = 10
 T = 2.0  # temperature for CE fitness (T>1 softens logits → smoother ES gradients)
 
 # ---- Tunable hyperparameters (agent may adjust these) ----
-LR_START = 0.022
-LR_DECAY = 0.95
+LR_START = 0.015
+LR_DECAY = 0.92
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
 N_BATCHES = (X_train.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
-GROUP_SIZE = 3  # process this many batches per ES gradient step
-N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 // 3 = 156 groups
+SMALL_VEC_DIM = HIDDEN_DIM * 4 + 10  # A1+B2+A2+B3+A3 = 522 (without B1)
+GROUP_SIZE = 2  # process this many batches per ES gradient step
+N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 // 2 = 234 groups
 
 
 @jax.jit
@@ -69,15 +70,16 @@ def train_all_epochs(w1, w2, w3, X_train, y_train, key):
     def epoch_step(carry, _):
         w1, w2, w3, key, sigma, lr = carry
 
+        # Generate B1 ONCE per epoch (784 elements = 60% of random data)
+        key, b1_key, data_key, epoch_rng_key = jax.random.split(key, 4)
+        B1 = jax.random.normal(b1_key, (HALF_POPULATION, 784), dtype=jnp.float32)
+        B1_f = B1.astype(jnp.bfloat16)
+
         # Shuffle data for this epoch, grouped into chunks of GROUP_SIZE batches
-        key, data_key = jax.random.split(key)
-        n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE  # 117 * 4 * 128 = 59904
+        n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
         perm = jax.random.permutation(data_key, X_train.shape[0])
         X_shuf = X_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)
         y_shuf = y_train[perm][:n_samples].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE)
-
-        # Use fold_in for per-batch key derivation (cheaper than split)
-        key, epoch_rng_key = jax.random.split(key)
 
         sigma_f32 = jnp.float32(sigma)
         T_f32 = jnp.float32(T)
@@ -87,23 +89,22 @@ def train_all_epochs(w1, w2, w3, X_train, y_train, key):
             w1, w2, w3, batch_idx = carry
             xb, yb = batch_data
 
+            # Generate only smaller vectors per batch (522 elements instead of 1306)
             batch_key = jax.random.fold_in(epoch_rng_key, batch_idx)
-            all_vecs = jax.random.normal(batch_key, (HALF_POPULATION, VEC_DIM), dtype=jnp.float32)
-            all_vecs_f = all_vecs.astype(jnp.bfloat16)
+            small_vecs = jax.random.normal(batch_key, (HALF_POPULATION, SMALL_VEC_DIM), dtype=jnp.float32)
+            small_vecs_f = small_vecs.astype(jnp.bfloat16)
 
-            B1_f = all_vecs_f[:, :784]
-            A1_f = all_vecs_f[:, 784:784+HIDDEN_DIM]
-            B2_f = all_vecs_f[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
-            A2_f = all_vecs_f[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM]
-            B3_f = all_vecs_f[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
-            A3_f = all_vecs_f[:, 784+4*HIDDEN_DIM:]
+            A1_f = small_vecs_f[:, :HIDDEN_DIM]
+            B2_f = small_vecs_f[:, HIDDEN_DIM:2*HIDDEN_DIM]
+            A2_f = small_vecs_f[:, 2*HIDDEN_DIM:3*HIDDEN_DIM]
+            B3_f = small_vecs_f[:, 3*HIDDEN_DIM:4*HIDDEN_DIM]
+            A3_f = small_vecs_f[:, 4*HIDDEN_DIM:]
 
-            B1 = all_vecs[:, :784]
-            A1 = all_vecs[:, 784:784+HIDDEN_DIM]
-            B2 = all_vecs[:, 784+HIDDEN_DIM:784+2*HIDDEN_DIM]
-            A2 = all_vecs[:, 784+2*HIDDEN_DIM:784+3*HIDDEN_DIM]
-            B3 = all_vecs[:, 784+3*HIDDEN_DIM:784+4*HIDDEN_DIM]
-            A3 = all_vecs[:, 784+4*HIDDEN_DIM:]
+            A1 = small_vecs[:, :HIDDEN_DIM]
+            B2 = small_vecs[:, HIDDEN_DIM:2*HIDDEN_DIM]
+            A2 = small_vecs[:, 2*HIDDEN_DIM:3*HIDDEN_DIM]
+            B3 = small_vecs[:, 3*HIDDEN_DIM:4*HIDDEN_DIM]
+            A3 = small_vecs[:, 4*HIDDEN_DIM:]
 
             xb_f = xb.astype(jnp.bfloat16)
             w1_f = w1.astype(jnp.bfloat16)
