@@ -1,25 +1,30 @@
-# EGGROLL Kernel Optimization — Agent Program
+# EGGROLL Optimization — Agent Program
 
-*You are an AI researcher. Your job: write custom Triton GPU kernels to make
-`mnist_eggroll_optimized.py` as fast as possible while keeping accuracy and
-memory within bounds. You work autonomously, run experiments, log results, and
-keep going without stopping to ask for permission.*
+*You are an AI researcher. Your job: make `mnist_eggroll_optimized.py` as fast
+as possible while keeping accuracy and memory within bounds. The kernel is
+already highly optimized — the next frontier is **algorithmic**: reducing the
+population size while maintaining accuracy. You work autonomously, run
+experiments, log results, and keep going without stopping to ask for permission.*
 
 ---
 
 ## The Goal
 
-Backprop trains a 784→128→128→10 MLP on MNIST in ~4.7s.
-EGGROLL (Evolution Strategies with low-rank perturbations) currently takes ~5.8s.
+Backprop trains a 784→128→128→10 MLP on MNIST in ~4.7s (JAX).
+EGGROLL (Evolution Strategies with low-rank perturbations) currently takes ~5.2s.
 
-**Close the gap using Triton GPU kernels and other fair optimizations.**
+**Close the gap by reducing HALF_POPULATION while maintaining accuracy.**
+
+The Triton kernel and JAX compilation are already exhaustively optimized (see
+"What worked" / "What did NOT work" below). The only remaining lever is
+**algorithmic**: a smaller population means fewer forward passes per batch,
+directly reducing both compute time and memory.
 
 Hard constraints enforced by `validate.py`:
 - Test accuracy ≥ 97.2% (average over seeds 11, 42, 7)
 - Peak GPU memory ≤ 500MB
-- Locked constants unchanged (see below)
 
-Speed target: ≤ 5s (stretch: ≤ 4.5s to match backprop).
+Speed target: ≤ 4.7s (match backprop). Stretch: ≤ 4.5s.
 
 ---
 
@@ -37,32 +42,39 @@ Speed target: ≤ 5s (stretch: ≤ 4.5s to match backprop).
 ## What You Can Modify
 
 **`mnist_eggroll_optimized.py`** — the training script. You may:
+- **Tune `HALF_POPULATION`** (currently 5000) — this is the primary optimization target.
+  Reducing it directly reduces compute and memory. You must also update `validate.py`
+  to match when you change it.
+- Tune `LR_START`, `LR_DECAY`, `SIGMA_START`, `SIGMA_DECAY`, `T` (labelled "tunable")
+- Modify the fitness shaping, perturbation sampling strategy, or gradient estimation
 - Replace JAX operations with Triton kernels
 - Restructure the forward pass, fitness computation, or gradient accumulation
-- Tune `LR_START`, `LR_DECAY`, `SIGMA_START`, `SIGMA_DECAY` (these are labelled "tunable")
 - Import from `kernels/` or inline Triton kernels directly
 
-**`kernels/`** — write Triton kernels here. Any structure you like.
+**`kernels/`** — Triton kernels. The fused 3-layer CE kernel may need HALF_POP
+updates if the grid dimensions change.
+
+**`validate.py`** — update the `REQUIRED["HALF_POPULATION"]` value to match
+when you change `HALF_POPULATION` in the training script.
 
 ---
 
-## What You Cannot Change (validate.py will catch violations)
+## What You Cannot Change
 
-The following constants must remain exactly as-is in the CONSTANTS block printed
-at the start of every run:
+The following constants are locked:
 
 ```
 HIDDEN_DIM:      128
 BATCH_SIZE:      128
 EPOCHS:          10
-HALF_POPULATION: 5000
-T:               2.0
 ```
 
 Also forbidden:
 - Changing the network architecture (layer count, activation function, output size)
 - Changing the dataset or data loading
-- Modifying `validate.py` or `benchmark.py`
+- Adding **momentum or state** that carries across batches (unfair vs backprop SGD,
+  which is stateless). Each batch's gradient estimate must depend only on the current
+  batch data and fresh random perturbations.
 - Installing packages not already in `pyproject.toml` (you may add triton/jax-triton)
 - **Changing the framework** (e.g., rewriting in PyTorch). Both EGGROLL and the backprop
   baseline must use JAX. A PyTorch EGGROLL at 4.2s vs JAX backprop at 4.7s is NOT a
@@ -93,6 +105,14 @@ Optimizations must be **honestly comparable** to the backprop baseline. Watch fo
    timing window.
 8. **Gradient precision**: gradient computation must use fp32 perturbation vectors.
    Do NOT substitute bf16 vectors for the gradient matmuls (`B.T @ (shaped * A)`).
+9. **No cross-batch state / momentum**: the ES gradient estimate for each batch must
+   depend only on fresh random perturbations and the current batch data. No EMA of
+   gradients, no reuse of perturbation directions from prior batches, no accumulated
+   statistics. Backprop SGD is stateless per batch — EGGROLL must be too.
+10. **Population reduction must reduce compute**: the goal of lowering HALF_POPULATION
+    is to reduce wall-clock time and memory. Do NOT compensate for smaller populations
+    with extra compute (e.g., multiple forward passes per perturbation, ensembling,
+    or increasing EPOCHS).
 
 ---
 
@@ -210,10 +230,19 @@ No bf16 data loading tricks — the comparison must be apples-to-apples.
 |--------------------|---------|--------|----------|
 | Backprop (fp32)    | ~4.7s   | ~391MB | ~97.3%   |
 | EGGROLL baseline   | ~27.3s  | ~390MB | ~97.6%   |
-| EGGROLL optimized  | ~5.8s   | ~389MB | ~97.4%   |
-| Your target        | ≤5s     | ≤500MB | ≥97.2%   |
+| EGGROLL optimized  | ~5.2s   | ~389MB | ~97.4%   |
+| Your target        | ≤4.7s   | ≤500MB | ≥97.2%   |
 
-Current speedup: 4.7x over baseline, 1.2x gap to backprop.
+Current speedup: 5.2x over baseline, 1.1x gap to backprop.
+
+**Population scaling** (approximate, from prior experiments):
+- HALF_POP=5000: ~5.2s, ~97.4% acc, ~389MB
+- HALF_POP=3000: ~4.0s est., accuracy unknown — **try this**
+- HALF_POP=2000: ~3.3s est., accuracy likely marginal
+- HALF_POP=1000: ~2.5s est., accuracy likely fails
+
+The kernel time scales roughly linearly with HALF_POP (more population = more
+blocks in the Triton grid). JIT time (~2.4s) is constant regardless of population.
 
 Always run `benchmark.py` at the start of a session to get the current baseline.
 Check `nvidia-smi` — if another process is using the GPU, numbers will be inflated.
@@ -393,26 +422,52 @@ The PyTorch rewrite eliminates JAX's 2.4s JIT but gives the same advantage to ba
 Comparing PyTorch EGGROLL (4.2s) vs JAX backprop (4.6s) is misleading. This approach
 is now explicitly forbidden in the rules above.
 
-## Ideas to try next
+## Ideas to try next — Population reduction
 
-### Remaining ideas (within JAX)
-1. **Write the kernel in raw CUDA/PTX** and call via JAX's FFI instead of jax-triton.
-   This would bypass the jax-triton serialization overhead (1.07s) while keeping the
-   hand-tuned kernel quality. Very complex to implement.
-2. **Persistent Triton kernel**: keep blocks resident on SMs across batches, computing
-   multiple batch steps per block launch. Would amortize kernel launch overhead and
-   potentially improve L2 cache reuse for weights. Requires restructuring the grid to
-   be batch-aware.
+The kernel and compilation are exhaustively optimized. The only remaining lever is
+**reducing HALF_POPULATION** while maintaining ≥97.2% accuracy.
 
-### Ideas that are exhausted or have known blockers
-- ~~PyTorch rewrite~~: 4.2s EGGROLL but unfair comparison (PyTorch backprop = 1.1s)
-- ~~Reduce PRNG HLO ops~~: tried counter-based PRNG, didn't reduce JIT (bridge, not PRNG,
-  is the bottleneck)
-- ~~Pallas kernels~~: 10× faster JIT for simple kernels but auto-generated Triton code
-  is 44% slower at execution. Net worse.
-- ~~Reduce kernel register pressure via maxnreg~~: either not passed through jax-triton
-  or spills offset gains
-- ~~Kernel restructuring (fused pos/neg, packed vectors)~~: all made performance worse
-- ~~Alternative loop structures (fori_loop, while_loop)~~: identical to scan
-- ~~XLA flags, donate_argnums~~: no effect
-- ~~Uniform perturbations~~: 0.1s faster but fails accuracy validation
+### Strategy 1: Hyperparameter sweep at lower populations
+Try HALF_POP = 4000, 3000, 2000, 1500 with tuned hyperparameters. For each population:
+- Sweep LR_START (0.008–0.020), LR_DECAY (0.85–0.95)
+- Sweep SIGMA_START (0.02–0.04), SIGMA_DECAY (0.995–1.0)
+- Sweep T (1.5–3.0) — higher temperature may help smaller populations by softening
+  the fitness landscape
+- Run 3-seed validation at each config to check robustness
+
+### Strategy 2: Better fitness shaping
+The current fitness shaping is z-score normalization. Alternatives that might help
+smaller populations extract more signal:
+- **Rank-based shaping**: rank perturbations by fitness, use rank as the weight.
+  More robust to outliers than z-score. (Note: OpenAI utility shaping failed before,
+  but rank-based is different.)
+- **Top-k selection**: only use the top-k best perturbations for the gradient estimate.
+  Concentrates the signal. Equivalent to truncation selection in evolutionary algorithms.
+- **Adaptive weighting**: weight perturbations by exp(fitness/temperature) instead of
+  linear fitness. Like a Boltzmann selection.
+
+### Strategy 3: Smarter perturbation sampling
+- **Orthogonal perturbations**: use QR decomposition to make the 2×HALF_POP perturbation
+  directions approximately orthogonal. Better coverage of the parameter space with fewer
+  directions. (Was tried before with "QR-orth" and didn't help at pop=5000, but might
+  matter more at pop=2000.)
+- **Stratified sampling**: partition the random vector space and sample evenly from
+  each partition. Reduces variance of the gradient estimate.
+
+### Strategy 4: Per-layer population
+Instead of using the same HALF_POP for all 3 layers, allocate population budget
+proportionally to layer importance. Layer 1 (784→128) has the most parameters and
+might need more perturbation directions than Layer 3 (128→10). This requires
+restructuring the perturbation generation and kernel call but could maintain accuracy
+with lower total population.
+
+### What NOT to try (forbidden by fairness rules)
+- ~~Momentum / EMA of gradients~~: unfair, backprop SGD is stateless
+- ~~Reusing perturbation directions across batches~~: cross-batch state, unfair
+- ~~Increasing EPOCHS~~: locked constant
+- ~~Ensembling or multiple passes~~: extra compute defeats the purpose
+- ~~PyTorch rewrite~~: unfair framework comparison
+
+### Kernel ideas that are exhausted
+- ~~All kernel parameter/structure changes~~: see Session 1-4 logs above
+- ~~Pallas, counter PRNG, XLA flags, fori_loop, donate_argnums~~: all tried, none helped
