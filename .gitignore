@@ -16,3 +16,4 @@ archived_results/
 run.log
 validate.log
 results.tsv
+sweep_*.csv

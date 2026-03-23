@@ -10,10 +10,10 @@ experiments, log results, and keep going without stopping to ask for permission.
 
 ## The Goal
 
-Backprop trains a 784→128→128→10 MLP on MNIST in ~4.7s (JAX).
-EGGROLL (Evolution Strategies with low-rank perturbations) currently takes ~5.2s.
+Backprop trains a 784→128→128→10 MLP on MNIST in ~1.5s (optimized JAX) or ~4.5s
+(naive JAX with Python loops). EGGROLL currently takes ~3.7s with HALF_POP=2750.
 
-**Close the gap by reducing HALF_POPULATION while maintaining accuracy.**
+**Close the gap to optimized backprop (1.5s) by further reducing HALF_POPULATION.**
 
 The Triton kernel and JAX compilation are already exhaustively optimized (see
 "What worked" / "What did NOT work" below). The only remaining lever is
@@ -24,7 +24,10 @@ Hard constraints enforced by `validate.py`:
 - Test accuracy ≥ 97.2% (average over seeds 11, 42, 7)
 - Peak GPU memory ≤ 500MB
 
-Speed target: ≤ 4.7s (match backprop). Stretch: ≤ 4.5s.
+Speed target: ≤ 3.0s. Stretch: ≤ 2.0s (close to optimized backprop's 1.5s).
+The old 4.7s "backprop" target was against a naive JAX implementation with per-batch
+GPU synchronization. The optimized backprop (lax.scan, all-in-one JIT) runs in 1.5s.
+See `mnist_backprop_optimized.py`.
 
 ---
 
@@ -121,20 +124,20 @@ Optimizations must be **honestly comparable** to the backprop baseline. Watch fo
 EGGROLL uses antithetic Evolution Strategies with low-rank perturbations.
 For each batch:
 
-1. Sample 5000 perturbation pairs (A_i, B_i) per layer — rank-1 directions
+1. Sample 2750 perturbation pairs (A_i, B_i) per layer — rank-1 directions
 2. For each population member i, perturb weights: W̃ = W + σ·outer(A_i, B_i)
 3. Run forward pass: output_i = gelu(x @ (W + σ·outer(A,B)))
-4. Evaluate fitness (temperature-scaled cross-entropy)
+4. Evaluate fitness (temperature-scaled, label-smoothed cross-entropy)
 5. Antithetic: also evaluate the negative perturbation (−σ) — halves variance
 6. Gradient estimate: Σ (fitness_diff_i · outer(B_i, A_i)) — no backprop needed
 
-The bottleneck is step 3: computing 10,000 forward passes per batch (5000 pos + 5000 neg).
+The bottleneck is step 3: computing 5,500 forward passes per batch (2750 pos + 2750 neg).
 The key insight: the perturbation is rank-1, so `x @ W̃ = x@W + σ·(x@B)·A`.
 This means you never need to materialize the full perturbed weight matrix.
 
 **The big intermediate tensor to eliminate:**
 ```python
-pert1 = xB1.T[:, :, None] * A1[:, None, :]   # shape (5000, 128, 128) = 80M elements
+pert1 = xB1.T[:, :, None] * A1[:, None, :]   # shape (2750, 128, 128) = 45M elements
 ```
 A fused Triton kernel can avoid materializing this in HBM.
 
@@ -226,23 +229,26 @@ No bf16 data loading tricks — the comparison must be apples-to-apples.
 
 ## Reference Numbers (uncontended GPU, RTX 4080 SUPER)
 
-| Implementation     | Time    | Memory | Accuracy |
-|--------------------|---------|--------|----------|
-| Backprop (fp32)    | ~4.7s   | ~391MB | ~97.3%   |
-| EGGROLL baseline   | ~27.3s  | ~390MB | ~97.6%   |
-| EGGROLL optimized  | ~5.2s   | ~389MB | ~97.4%   |
-| Your target        | ≤4.7s   | ≤500MB | ≥97.2%   |
+| Implementation           | Time    | Memory | Accuracy |
+|--------------------------|---------|--------|----------|
+| Backprop optimized (JAX) | ~1.5s   | ~389MB | ~97.5%   |
+| Backprop naive (JAX)     | ~4.5s   | ~391MB | ~97.3%   |
+| EGGROLL baseline         | ~27.3s  | ~390MB | ~97.6%   |
+| EGGROLL optimized        | ~3.7s   | ~389MB | ~97.2%   |
+| Your target              | ≤3.0s   | ≤500MB | ≥97.2%   |
 
-Current speedup: 5.2x over baseline, 1.1x gap to backprop.
+Current speedup: 7.3x over baseline, 2.5x gap to optimized backprop.
 
-**Population scaling** (approximate, from prior experiments):
-- HALF_POP=5000: ~5.2s, ~97.4% acc, ~389MB
-- HALF_POP=3000: ~4.0s est., accuracy unknown — **try this**
-- HALF_POP=2000: ~3.3s est., accuracy likely marginal
-- HALF_POP=1000: ~2.5s est., accuracy likely fails
+**Population scaling** (measured, Session 5, with label smoothing + L3 boost):
+- HALF_POP=5000: ~5.2s, ~97.4% acc (no smoothing needed)
+- HALF_POP=4000: ~4.5s, ~97.3% acc (no smoothing needed)
+- HALF_POP=3500: ~4.3s, ~97.3% acc (α=0.1 smoothing)
+- HALF_POP=3000: ~3.9s, ~97.3% acc (α=0.02 smoothing)
+- HALF_POP=2750: ~3.7s, ~97.2% acc (α=0.02, current)
+- HALF_POP=2500: ~3.5s est., accuracy fails all configs
+- HALF_POP=2000: ~3.1s est., accuracy likely <96.5%
 
-The kernel time scales roughly linearly with HALF_POP (more population = more
-blocks in the Triton grid). JIT time (~2.4s) is constant regardless of population.
+The kernel time scales roughly linearly with HALF_POP. JIT time (~1.6s) is constant.
 
 Always run `benchmark.py` at the start of a session to get the current baseline.
 Check `nvidia-smi` — if another process is using the GPU, numbers will be inflated.
@@ -385,7 +391,23 @@ The HLO graph has ~1270 ops, of which 338 (27%) are threefry PRNG bit operations
 but replacing PRNG with counter-based hashing (~30 ops) didn't reduce JIT. The
 PRNG ops are NOT the compilation bottleneck.
 
-## Time budget breakdown (where 5.8s goes) — verified Session 4
+## Time budget breakdown (where 3.7s goes) — updated Session 5
+
+At HALF_POP=2750 with label smoothing + L3 boost:
+
+### Component breakdown (3.7s total)
+| Component | Time | % | Notes |
+|-----------|------|---|-------|
+| JIT compilation | 1.6s | 43% | XLA + jax-triton serialization |
+| Triton kernel | ~1.6s | 43% | 2750×2×2 = 11K blocks per batch |
+| Random generation | ~0.07s | 2% | jax.random.normal (2750×1306) |
+| Gradient matmuls | ~0.15s | 4% | B.T @ (shaped * A) for 3 layers |
+| Data prep | ~0.2s | 5% | CPU shuffle + GPU transfer |
+
+The kernel achieves ~12% of FP8 peak throughput at 25% occupancy (4 blocks/SM,
+limited by ~113 registers/thread). JIT is dominated by jax-triton bridge serialization.
+
+### Previous breakdown (where 5.8s went) — verified Session 4
 
 ### JIT breakdown (2.39s total)
 | Component | Time | Notes |
@@ -412,6 +434,35 @@ due to 25% occupancy (4 blocks/SM, limited by ~113 registers/thread).
 To reach 5s: need to save ~0.8s. The jax-triton bridge (1.07s) is the single largest
 reducible cost, but Pallas can't replace it without losing kernel quality.
 
+### Session 5 (5.2s → 3.7s) — algorithmic population reduction
+13. **Label smoothing in CE fitness** (5.2s → 3.9s at pop3000): replacing hard one-hot
+    labels with `(1-α) * one_hot + α/num_classes` in the kernel's CE computation gives
+    the ES gradient estimator information about ALL class logits, not just the correct
+    one. This provides a richer fitness signal per perturbation, enabling lower populations.
+    Optimal α scales inversely with population: pop5000→0, pop3500→0.1, pop3000→0.02,
+    pop2750→0.02. At pop2500, no α value rescues accuracy.
+
+14. **Per-layer LR scaling** (improves accuracy ~0.05pp): layer 3 (128→10, 1280 params)
+    gets a much better gradient estimate from N perturbations than layer 1 (784→128,
+    100K params). Using 2x learning rate for layer 3 gives better accuracy and
+    consistency. Higher boosts (3x+) or boosting layer 2 hurts.
+
+15. **Hyperparameter tuning at lower pop**: LR_DECAY=0.88 (was 0.88 at pop5000 too)
+    works best at pop2750. LR_START=0.012, SIGMA_START=0.028 unchanged.
+
+### What did NOT work — Session 5 (algorithmic)
+- **Rank-based fitness shaping**: 95.6% accuracy — far worse than z-score.
+- **Top-k truncation** (keep top 50%): 96.8% — worse than using all perturbations.
+- **Boltzmann/softmax weighting**: 86.6% — catastrophic.
+- **One-sided ES** (no antithetic): needs 2x population for same accuracy, no savings.
+- **Rademacher/uniform perturbations**: too noisy for reliable 97.2% accuracy.
+- **No-shuffle optimization**: saves 0.2s but costs 0.15pp accuracy — not worth it.
+- **Batch-order shuffle**: same accuracy as no-shuffle (within-batch composition matters).
+- **Different initializations** (glorot, he, lecun): orthogonal still best.
+- **L3 boost >2x or L2 boost**: hurt accuracy.
+- **Sigma variations** at pop4000: sigma=0.028 is optimal.
+- **Label smoothing α>0.1**: too aggressive, over-softens fitness signal.
+
 ### PyTorch rewrite (tested Session 4, ruled unfair)
 A full PyTorch + Triton rewrite was tested. Results:
 - PyTorch EGGROLL: **4.2s**, 97.4% acc, 292MB — target reached
@@ -422,52 +473,64 @@ The PyTorch rewrite eliminates JAX's 2.4s JIT but gives the same advantage to ba
 Comparing PyTorch EGGROLL (4.2s) vs JAX backprop (4.6s) is misleading. This approach
 is now explicitly forbidden in the rules above.
 
-## Ideas to try next — Population reduction
+## Ideas to try next — Further population reduction
 
-The kernel and compilation are exhaustively optimized. The only remaining lever is
-**reducing HALF_POPULATION** while maintaining ≥97.2% accuracy.
+HALF_POP=2750 is the current floor. Pop2500 fails accuracy with all tested configs
+(50+ combos of α, LR, sigma, L3 boost). To go lower, you need fundamentally better
+gradient estimation from fewer perturbations.
 
-### Strategy 1: Hyperparameter sweep at lower populations
-Try HALF_POP = 4000, 3000, 2000, 1500 with tuned hyperparameters. For each population:
-- Sweep LR_START (0.008–0.020), LR_DECAY (0.85–0.95)
-- Sweep SIGMA_START (0.02–0.04), SIGMA_DECAY (0.995–1.0)
-- Sweep T (1.5–3.0) — higher temperature may help smaller populations by softening
-  the fitness landscape
-- Run 3-seed validation at each config to check robustness
+### What's already been tried and failed (don't re-test these)
+- ~~Rank-based, top-k, Boltzmann fitness shaping~~ — all worse than z-score
+- ~~One-sided ES~~ — needs 2x pop for same accuracy
+- ~~Rademacher/uniform perturbations~~ — too noisy
+- ~~Orthogonal perturbations via QR~~ — too expensive per-batch
+- ~~No-shuffle~~ — saves 0.2s but costs accuracy
+- ~~L3 boost >2x, L2 boost~~ — hurts accuracy
+- ~~Different initializations~~ — orthogonal is best
+- ~~All kernel params~~ — exhaustively optimized Sessions 1-4
+- ~~Pallas kernels~~ — worse execution, marginal JIT savings
+- ~~Momentum / EMA / cross-batch state~~ — forbidden
 
-### Strategy 2: Better fitness shaping
-The current fitness shaping is z-score normalization. Alternatives that might help
-smaller populations extract more signal:
-- **Rank-based shaping**: rank perturbations by fitness, use rank as the weight.
-  More robust to outliers than z-score. (Note: OpenAI utility shaping failed before,
-  but rank-based is different.)
-- **Top-k selection**: only use the top-k best perturbations for the gradient estimate.
-  Concentrates the signal. Equivalent to truncation selection in evolutionary algorithms.
-- **Adaptive weighting**: weight perturbations by exp(fitness/temperature) instead of
-  linear fitness. Like a Boltzmann selection.
+### Ideas that haven't been tried
+1. **Variance-reduced gradient estimation**: use control variates to reduce gradient
+   noise. E.g., subtract the gradient estimate from a simpler surrogate model.
+   Different from z-score normalization (which is a shaping, not variance reduction).
 
-### Strategy 3: Smarter perturbation sampling
-- **Orthogonal perturbations**: use QR decomposition to make the 2×HALF_POP perturbation
-  directions approximately orthogonal. Better coverage of the parameter space with fewer
-  directions. (Was tried before with "QR-orth" and didn't help at pop=5000, but might
-  matter more at pop=2000.)
-- **Stratified sampling**: partition the random vector space and sample evenly from
-  each partition. Reduces variance of the gradient estimate.
+2. **Adaptive label smoothing per epoch**: start with α=0.1 (more smoothing when
+   gradients are noisy early in training) and decay to α=0.01 by the end. The optimal
+   α might change as the loss landscape evolves.
 
-### Strategy 4: Per-layer population
-Instead of using the same HALF_POP for all 3 layers, allocate population budget
-proportionally to layer importance. Layer 1 (784→128) has the most parameters and
-might need more perturbation directions than Layer 3 (128→10). This requires
-restructuring the perturbation generation and kernel call but could maintain accuracy
-with lower total population.
+3. **Per-layer perturbation scaling**: instead of the same sigma for all layers,
+   use different sigma_l proportional to the layer's gradient noise level.
+   Different from per-layer LR (which was tested) — this changes the PERTURBATION
+   scale, not the update scale.
+
+4. **Structured random matrices**: use fast transforms (Hadamard, DCT) instead of
+   dense Gaussian vectors for perturbations. Can provide better space coverage with
+   the same number of perturbations. Different from orthogonalization (QR is O(N^3),
+   Hadamard is O(N log N)).
+
+5. **Gradient accumulation across perturbation subsets**: split 2750 perturbations
+   into K groups, compute gradient from each group, average. Might reduce variance
+   compared to one big z-score normalization. NOT cross-batch state — all within
+   one batch's perturbation set.
+
+6. **Learned perturbation directions**: pre-train a set of perturbation basis vectors
+   on the first epoch's data, then reuse for subsequent epochs. Only useful if the
+   basis is computed ONCE inside the training timer (not pre-computed).
+
+7. **Migrating from jax-triton to Pallas backend='triton'**: the jax-triton package
+   is unmaintained. Pallas with the Triton backend uses a newer XLA-native compilation
+   pipeline. JIT savings estimated at ~0.3s. Requires rewriting the kernel in Pallas DSL.
+
+8. **Reducing JIT via scan restructuring**: JIT is 1.6s (43% of total). If you could
+   move the Triton kernel call outside the scan body, JIT drops by ~0.5s. This would
+   require a vectorized (non-scan) approach to the forward pass.
 
 ### What NOT to try (forbidden by fairness rules)
 - ~~Momentum / EMA of gradients~~: unfair, backprop SGD is stateless
 - ~~Reusing perturbation directions across batches~~: cross-batch state, unfair
 - ~~Increasing EPOCHS~~: locked constant
 - ~~Ensembling or multiple passes~~: extra compute defeats the purpose
-- ~~PyTorch rewrite~~: unfair framework comparison
-
-### Kernel ideas that are exhausted
-- ~~All kernel parameter/structure changes~~: see Session 1-4 logs above
-- ~~Pallas, counter PRNG, XLA flags, fori_loop, donate_argnums~~: all tried, none helped
+- ~~Framework rewrite (PyTorch)~~: unfair comparison (PyTorch backprop is 1.1s)
+- ~~Compilation caching~~: unfair AOT warmup
