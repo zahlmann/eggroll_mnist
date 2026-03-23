@@ -234,19 +234,19 @@ No bf16 data loading tricks — the comparison must be apples-to-apples.
 | Backprop optimized (JAX) | ~1.5s   | ~389MB | ~97.5%   |
 | Backprop naive (JAX)     | ~4.5s   | ~391MB | ~97.3%   |
 | EGGROLL baseline         | ~27.3s  | ~390MB | ~97.6%   |
-| EGGROLL optimized        | ~3.7s   | ~389MB | ~97.2%   |
+| EGGROLL optimized        | ~3.0s   | ~389MB | ~97.3%   |
 | Your target              | ≤3.0s   | ≤500MB | ≥97.2%   |
 
-Current speedup: 7.3x over baseline, 2.5x gap to optimized backprop.
+Current speedup: 9.1x over baseline, 2.0x gap to optimized backprop.
 
-**Population scaling** (measured, Session 5, with label smoothing + L3 boost):
+**Population scaling** (measured, Session 6, with adaptive smoothing + Winsorized z-score):
 - HALF_POP=5000: ~5.2s, ~97.4% acc (no smoothing needed)
-- HALF_POP=4000: ~4.5s, ~97.3% acc (no smoothing needed)
-- HALF_POP=3500: ~4.3s, ~97.3% acc (α=0.1 smoothing)
-- HALF_POP=3000: ~3.9s, ~97.3% acc (α=0.02 smoothing)
-- HALF_POP=2750: ~3.7s, ~97.2% acc (α=0.02, current)
-- HALF_POP=2500: ~3.5s est., accuracy fails all configs
-- HALF_POP=2000: ~3.1s est., accuracy likely <96.5%
+- HALF_POP=2750: ~3.7s, ~97.2% acc (constant α=0.02)
+- HALF_POP=2500: ~3.5s, ~97.2% acc (adaptive α=0.10*0.7^epoch)
+- HALF_POP=2250: ~3.3s, ~97.2% acc (σ=0.032, α=0.12 adaptive)
+- HALF_POP=2000: ~3.0s, ~97.3% acc (σ=0.036, α=0.20*0.5^epoch, Winsorized ±2σ, uint8 transfer)
+- HALF_POP=1850: ~2.9s, ~97.2% acc (marginal, passes ~60% of validation runs)
+- HALF_POP=1750: ~2.8s, ~97.1% acc (fails validation reliably)
 
 The kernel time scales roughly linearly with HALF_POP. JIT time (~1.6s) is constant.
 
@@ -391,18 +391,18 @@ The HLO graph has ~1270 ops, of which 338 (27%) are threefry PRNG bit operations
 but replacing PRNG with counter-based hashing (~30 ops) didn't reduce JIT. The
 PRNG ops are NOT the compilation bottleneck.
 
-## Time budget breakdown (where 3.7s goes) — updated Session 5
+## Time budget breakdown (where 3.0s goes) — updated Session 6
 
-At HALF_POP=2750 with label smoothing + L3 boost:
+At HALF_POP=2000 with adaptive smoothing + Winsorized z-score + uint8 transfer:
 
-### Component breakdown (3.7s total)
+### Component breakdown (3.0s total)
 | Component | Time | % | Notes |
 |-----------|------|---|-------|
-| JIT compilation | 1.6s | 43% | XLA + jax-triton serialization |
-| Triton kernel | ~1.6s | 43% | 2750×2×2 = 11K blocks per batch |
-| Random generation | ~0.07s | 2% | jax.random.normal (2750×1306) |
-| Gradient matmuls | ~0.15s | 4% | B.T @ (shaped * A) for 3 layers |
-| Data prep | ~0.2s | 5% | CPU shuffle + GPU transfer |
+| JIT compilation | ~1.6s | 53% | XLA + jax-triton serialization |
+| Triton kernel | ~1.16s | 39% | 2000×2×2 = 8K blocks per batch |
+| Random generation | ~0.05s | 2% | jax.random.normal (2000×1306) |
+| Gradient matmuls | ~0.11s | 4% | B.T @ (shaped * A) for 3 layers |
+| Data prep | ~0.07s | 2% | CPU shuffle (uint8) + GPU transfer + float32 convert |
 
 The kernel achieves ~12% of FP8 peak throughput at 25% occupancy (4 blocks/SM,
 limited by ~113 registers/thread). JIT is dominated by jax-triton bridge serialization.
@@ -473,59 +473,82 @@ The PyTorch rewrite eliminates JAX's 2.4s JIT but gives the same advantage to ba
 Comparing PyTorch EGGROLL (4.2s) vs JAX backprop (4.6s) is misleading. This approach
 is now explicitly forbidden in the rules above.
 
-## Ideas to try next — Further population reduction
+### Session 6 (3.7s → 3.0s) — algorithmic + transfer optimizations
 
-HALF_POP=2750 is the current floor. Pop2500 fails accuracy with all tested configs
-(50+ combos of α, LR, sigma, L3 boost). To go lower, you need fundamentally better
-gradient estimation from fewer perturbations.
+16. **Adaptive label smoothing schedule** (broke pop2500 barrier): parameterized
+    the kernel's hardcoded α=0.02 as a runtime parameter. Using α_start=0.20 with
+    α_decay=0.5 per epoch gives α=[0.200, 0.100, 0.050, 0.025, 0.013, 0.006, ...].
+    Very high smoothing early (random weights → noisy gradients benefit most from
+    smoothing) decaying to near-zero (fine-tuning benefits from sharp CE). This broke
+    through the pop2500 barrier that 50+ constant-α configs failed at.
+
+17. **Winsorized z-score** (made pop2000 reliable): clipping z-score normalized
+    fitness differences to ±2.0 removes the outsized influence of outlier perturbation
+    fitness values. At pop2000, this improved reliability from 50% → 90% validation
+    pass rate. Clip at ±2.0 is optimal (tested ±1.5, ±2.5, ±3.0).
+
+18. **Higher sigma at low pop** (σ=0.028 → 0.036): with fewer perturbations, a
+    larger perturbation scale gives a stronger fitness signal (higher SNR). The
+    increased bias from larger perturbations is offset by reduced variance.
+
+19. **uint8 data transfer** (saves ~0.1s): store training data as uint8 in CPU memory,
+    transfer 4x smaller buffer to GPU, convert to float32 on GPU. MNIST pixels are
+    exactly representable as uint8/255. Training computation is still fp32.
+
+### What did NOT work — Session 6
+- **Per-layer sigma scaling** (scaling A vectors by per-layer factors): ALL configs
+  reduced accuracy at pop1750. Reducing L1's sigma (even modestly to 0.7x) is
+  catastrophic. L1's large perturbation magnitude is NEEDED for its 100K parameters.
+- **Structured perturbations (Hadamard-Rademacher via FWHT)**: the 11 butterfly
+  operations inside the scan body add ~1.5s JIT overhead with no accuracy improvement.
+  Dead end for JAX.
+- **No-shuffle at pop2000**: saves 0.17s but costs ~0.1pp accuracy, making it
+  unreliable. MNIST is pre-shuffled but training still benefits from epoch-level
+  permutation at low populations.
+- **Temperature tuning** (T=1.5, 2.5, 3.0): T=2.5 helps slightly at very low
+  populations but doesn't provide reliable improvement at pop2000.
+
+## Ideas to try next — Reaching the stretch goal (2.0s)
+
+HALF_POP=2000 with adaptive smoothing + Winsorized z-score reliably achieves
+3.0s at 97.26% avg accuracy. Pop1850 is marginal (~60% pass rate).
+
+To reach 2.0s, need to save another 1.0s. Time budget at pop2000:
+- JIT: ~1.6s (53%) — dominated by jax-triton bridge (1.07s)
+- Kernel execution: ~1.16s (39%)
+- Data prep: ~0.07s (2%, with uint8)
+- Other: ~0.17s (6%)
 
 ### What's already been tried and failed (don't re-test these)
-- ~~Rank-based, top-k, Boltzmann fitness shaping~~ — all worse than z-score
-- ~~One-sided ES~~ — needs 2x pop for same accuracy
-- ~~Rademacher/uniform perturbations~~ — too noisy
-- ~~Orthogonal perturbations via QR~~ — too expensive per-batch
-- ~~No-shuffle~~ — saves 0.2s but costs accuracy
-- ~~L3 boost >2x, L2 boost~~ — hurts accuracy
-- ~~Different initializations~~ — orthogonal is best
-- ~~All kernel params~~ — exhaustively optimized Sessions 1-4
-- ~~Pallas kernels~~ — worse execution, marginal JIT savings
-- ~~Momentum / EMA / cross-batch state~~ — forbidden
+- ~~All items from Sessions 1-5~~ — see above
+- ~~Per-layer sigma scaling~~ — hurts accuracy
+- ~~Structured perturbations (FWHT)~~ — too much JIT overhead
+- ~~No-shuffle~~ — costs too much accuracy at low pop
+- ~~Temperature tuning~~ — marginal effect
 
 ### Ideas that haven't been tried
-1. **Variance-reduced gradient estimation**: use control variates to reduce gradient
-   noise. E.g., subtract the gradient estimate from a simpler surrogate model.
-   Different from z-score normalization (which is a shaping, not variance reduction).
+1. **Reducing JIT via scan restructuring**: JIT is 1.6s (53% of total). If you could
+   move the Triton kernel call outside the scan body, JIT drops by ~0.5s. This would
+   require a vectorized (non-scan) approach to the forward pass.
 
-2. **Adaptive label smoothing per epoch**: start with α=0.1 (more smoothing when
-   gradients are noisy early in training) and decay to α=0.01 by the end. The optimal
-   α might change as the loss landscape evolves.
+2. **Migrating from jax-triton to Pallas backend='triton'**: the jax-triton package
+   is unmaintained. Pallas with the Triton backend uses a newer XLA-native compilation
+   pipeline. JIT savings estimated at ~0.3s. Requires rewriting the kernel in Pallas DSL.
+   Note: Session 3 found Pallas execution is 1.42s slower, but that was at pop5000.
+   At pop2000 the execution gap may be smaller.
 
-3. **Per-layer perturbation scaling**: instead of the same sigma for all layers,
-   use different sigma_l proportional to the layer's gradient noise level.
-   Different from per-layer LR (which was tested) — this changes the PERTURBATION
-   scale, not the update scale.
-
-4. **Structured random matrices**: use fast transforms (Hadamard, DCT) instead of
-   dense Gaussian vectors for perturbations. Can provide better space coverage with
-   the same number of perturbations. Different from orthogonalization (QR is O(N^3),
-   Hadamard is O(N log N)).
-
-5. **Gradient accumulation across perturbation subsets**: split 2750 perturbations
+3. **Gradient accumulation across perturbation subsets**: split 2000 perturbations
    into K groups, compute gradient from each group, average. Might reduce variance
    compared to one big z-score normalization. NOT cross-batch state — all within
    one batch's perturbation set.
 
-6. **Learned perturbation directions**: pre-train a set of perturbation basis vectors
+4. **Learned perturbation directions**: pre-train a set of perturbation basis vectors
    on the first epoch's data, then reuse for subsequent epochs. Only useful if the
    basis is computed ONCE inside the training timer (not pre-computed).
 
-7. **Migrating from jax-triton to Pallas backend='triton'**: the jax-triton package
-   is unmaintained. Pallas with the Triton backend uses a newer XLA-native compilation
-   pipeline. JIT savings estimated at ~0.3s. Requires rewriting the kernel in Pallas DSL.
-
-8. **Reducing JIT via scan restructuring**: JIT is 1.6s (43% of total). If you could
-   move the Triton kernel call outside the scan body, JIT drops by ~0.5s. This would
-   require a vectorized (non-scan) approach to the forward pass.
+5. **Variance-reduced gradient estimation**: use control variates to reduce gradient
+   noise. The antithetic trick already provides good variance reduction, but additional
+   techniques (e.g., Stein variational gradient) might help.
 
 ### What NOT to try (forbidden by fairness rules)
 - ~~Momentum / EMA of gradients~~: unfair, backprop SGD is stateless
