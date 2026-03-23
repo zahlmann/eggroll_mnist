@@ -70,7 +70,7 @@ GROUP_SIZE = 1  # each ES gradient step uses one batch (fair: same as backprop b
 N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 groups
 
 
-@partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4))
+@partial(jax.jit, donate_argnums=(0, 1, 2))
 def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
     """Train all epochs in a single JIT call — eliminates Python loop overhead."""
 
