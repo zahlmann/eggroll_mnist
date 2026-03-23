@@ -8,14 +8,14 @@ Same architecture (784-128-128-10 MLP, GELU, 10 epochs), same GPU (RTX 4080 SUPE
 
 | | Backprop (optimized) | Backprop (naive) | EGGROLL |
 |---|---|---|---|
-| **Training time** | **1.5s** | 4.5s | **2.9s** |
+| **Training time** | **1.5s** | 4.5s | **2.3s** |
 | **Per-epoch compute** | 0.03s | 0.2s | **0.14s** |
 | **Test accuracy** | 97.5% | 97.3% | 97.3% |
 | **Peak memory** | 389 MB | 391 MB | 389 MB |
 
 Both JAX implementations use `jax.lax.scan` + all-in-one JIT. The naive backprop uses Python loops with per-batch GPU synchronization, which inflates its time 3x.
 
-EGGROLL is **1.9x slower** than optimized backprop at equal optimization level. It does **3,600x more FLOPs** per batch (3,600 forward passes via 1,800 antithetic perturbation pairs vs 1 forward + 1 backward). The fused Triton kernel with FP8 tensor cores compresses this compute gap from 3600x to 1.9x.
+EGGROLL is **1.5x slower** than optimized backprop at equal optimization level. It does **3,360x more FLOPs** per batch (3,360 forward passes via 1,680 antithetic perturbation pairs vs 1 forward + 1 backward). The fused Triton kernel with FP8 tensor cores compresses this compute gap from 3360x to 1.5x.
 
 ### How to run
 
@@ -36,7 +36,7 @@ To reproduce or extend: point a coding agent at `program.md` and let it run. The
 
 ### What made it fast
 
-The optimization went from **27s to 2.9s** (9.4x speedup). Key optimizations:
+The optimization went from **27s to 2.3s** (12.1x speedup). Key optimizations:
 
 **Sessions 1-4: Kernel + compilation (27s -> 5.2s)**
 
@@ -60,6 +60,14 @@ The optimization went from **27s to 2.9s** (9.4x speedup). Key optimizations:
 
 10. **Higher sigma at low pop** (σ=0.036) — with fewer perturbations, a larger perturbation scale gives stronger fitness signal. Combined with the above, enabled reducing population from 2750 to 1800.
 
+**Session 7: JIT reduction + population tuning (2.9s -> 2.3s)**
+
+11. **Disable XLA Triton GEMM autotuner** — `--xla_gpu_enable_triton_gemm=false` makes XLA fall back to cuBLAS for internal matmuls, saving ~0.6s of JIT compilation. The autotuner was generating and benchmarking custom Triton GEMM kernels for each matmul shape during compilation — the single largest JIT cost.
+
+12. **Pop1680 with CUDA wave alignment** — 1680 perturbation pairs give 21.0 full CUDA waves with zero tail (vs 22.5 waves at pop1800). Retuned alpha schedule (α=0.30, decay 0.50) maintains accuracy.
+
+13. **JIT/data transfer overlap** — abstract shape lowering (`jax.ShapeDtypeStruct`) allows JIT compilation to start without GPU memory allocation while data transfers in a background thread.
+
 See `kernels/fused_3layer_ce.py` and `program.md` for the full optimization log.
 
 ### What didn't work
@@ -70,8 +78,11 @@ BLOCK_B=16/128, BLOCK_K=64, num_stages=2+, num_warps=2/8, doubly-tiled J+K kerne
 **Algorithmic (Sessions 5-6):**
 Rank-based fitness shaping (95.6%), top-k truncation (96.8%), Boltzmann/softmax weighting (86.6%), one-sided ES (needs 2x pop), Rademacher/uniform perturbations, per-layer sigma scaling (hurts L1 gradient), structured perturbations via FWHT (+1.5s JIT), cosine LR (worse than exponential), temperature tuning (marginal), no-shuffle at low pop (costs accuracy), uint8 data transfer (setup hiding — reverted).
 
+**Session 7:**
+Pure JAX forward (4.6x slower), Python loop (dispatch overhead), pop1600 (accuracy unreliable), shared perturbation vectors (94.5% acc), ReLU activation (forbidden), 10+ XLA flags, all kernel tuning configs, pre-split epoch keys (hurt accuracy), GPU-side batch shuffle (memory over limit).
+
 ### Background
 
 Implements the EGGROLL algorithm from ["Evolution Strategies at the Hyperscale"](https://arxiv.org/pdf/2511.16652) (Sarkar et al., 2025). EGGROLL uses low-rank (rank-1) perturbations so that perturbed forward passes never materialize full weight matrices: `x @ (W + sigma * outer(A, B)) = x @ W + sigma * (x @ B) * A`.
 
-The ES gradient signal uses temperature-scaled cross-entropy (T=2.0) with adaptive label smoothing (α=0.20 decaying 0.5x/epoch) and antithetic sampling. Fitness normalization uses per-subgroup Winsorized z-score (K=8, clip ±2.0). Population size is 1,800 (3,600 effective with antithetic pairs).
+The ES gradient signal uses temperature-scaled cross-entropy (T=2.0) with adaptive label smoothing (α=0.30 decaying 0.50x/epoch) and antithetic sampling. Fitness normalization uses per-subgroup Winsorized z-score (K=8, clip ±2.0). Population size is 1,680 (3,360 effective with antithetic pairs).
