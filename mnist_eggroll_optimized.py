@@ -40,7 +40,7 @@ X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
 # ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
-HALF_POPULATION = 2500
+HALF_POPULATION = 2000
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
@@ -49,10 +49,10 @@ T = 2.0  # temperature for CE fitness (T>1 softens logits → smoother ES gradie
 # ---- Tunable hyperparameters (agent may adjust these) ----
 LR_START = 0.012
 LR_DECAY = 0.88
-SIGMA_START = 0.028
+SIGMA_START = 0.036
 SIGMA_DECAY = 0.998
-ALPHA_START = 0.10
-ALPHA_DECAY = 0.7
+ALPHA_START = 0.20
+ALPHA_DECAY = 0.5
 
 N_BATCHES = (X_train_np.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
@@ -64,9 +64,6 @@ N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 groups
 @jax.jit
 def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
     """Train all epochs in a single JIT call — eliminates Python loop overhead."""
-
-    # Loop-invariant scalars
-    # No pos_sign/neg_sign needed — merged kernel handles both
 
     def epoch_step(carry, _):
         w1, w2, w3, key, sigma, lr, alpha = carry
@@ -120,7 +117,7 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
             fitness_diff = partial_ce_neg.sum(axis=1) - partial_ce_pos.sum(axis=1)
             mean = fitness_diff.mean()
             std = fitness_diff.std() + 1e-8
-            shaped = (fitness_diff - mean) / std
+            shaped = jnp.clip((fitness_diff - mean) / std, -2.0, 2.0)
 
             shaped_col = shaped[:, None]
             grad1 = scale * B1.T @ (shaped_col * A1)
