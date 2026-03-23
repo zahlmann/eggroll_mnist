@@ -21,7 +21,7 @@ REQUIRED = {
     "HIDDEN_DIM": 128,
     "BATCH_SIZE": 128,
     "EPOCHS": 10,
-    "HALF_POPULATION": 1800,
+    "HALF_POPULATION": 1600,
     "T": 2.0,
 }
 
