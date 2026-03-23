@@ -34,7 +34,7 @@ if not os.path.exists("mnist_prepped_float.npz"):
     exit(1)
 
 data = np.load("mnist_prepped_float.npz")
-X_train_np = data["X_train"]  # keep in CPU memory
+X_train_u8 = (data["X_train"] * 255).astype(np.uint8)  # uint8 for fast CPU→GPU transfer
 y_train_np = data["y_train"]  # keep in CPU memory
 X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
@@ -54,7 +54,7 @@ SIGMA_DECAY = 0.998
 ALPHA_START = 0.20
 ALPHA_DECAY = 0.5
 
-N_BATCHES = (X_train_np.shape[0] // BATCH_SIZE)  # drop last incomplete batch
+N_BATCHES = (X_train_u8.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
 
 GROUP_SIZE = 1  # each ES gradient step uses one batch (fair: same as backprop baseline)
@@ -182,8 +182,8 @@ def main():
     # Shuffle once on CPU, group, and transfer to GPU (included in timing)
     rng = np.random.default_rng(args.seed)
     n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
-    perm = rng.permutation(X_train_np.shape[0])
-    X_grouped = jnp.array(X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1))
+    perm = rng.permutation(X_train_u8.shape[0])
+    X_grouped = jnp.array(X_train_u8[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)).astype(jnp.float32) / 255.0
     y_grouped = jnp.array(y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE))
 
     w1, w2, w3 = train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key)
