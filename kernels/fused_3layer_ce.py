@@ -91,7 +91,9 @@ def _fused_3layer_ce_kernel(
     log_sm = scaled - max_val - tl.log(tl.sum(exp_val, axis=1)[:, None])
 
     one_hot = (tl.arange(0, OUT_DIM_PAD)[None, :] == y_labels[:, None]).to(tl.float32)
-    ce = -tl.sum(log_sm * one_hot, axis=1)
+    smooth = 0.9 * one_hot + 0.1 / 10.0
+    smooth = tl.where(tl.arange(0, OUT_DIM_PAD)[None, :] >= OUT_DIM, 0.0, smooth)
+    ce = -tl.sum(log_sm * smooth, axis=1)
     ce = tl.where(mask_b, ce, 0.0)
     tl.store(partial_ce_ptr + pid_p * N_TILES + pid_b, tl.sum(ce))
 
@@ -178,7 +180,9 @@ def _fused_3layer_ce_both_kernel(
     log_sm = scaled - max_val - tl.log(tl.sum(exp_val, axis=1)[:, None])
 
     one_hot = (tl.arange(0, OUT_DIM_PAD)[None, :] == y_labels[:, None]).to(tl.float32)
-    ce = -tl.sum(log_sm * one_hot, axis=1)
+    smooth = 0.9 * one_hot + 0.1 / 10.0
+    smooth = tl.where(tl.arange(0, OUT_DIM_PAD)[None, :] >= OUT_DIM, 0.0, smooth)
+    ce = -tl.sum(log_sm * smooth, axis=1)
     ce = tl.where(mask_b, ce, 0.0)
 
     # Write to pos or neg output based on pid_sign

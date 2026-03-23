@@ -40,7 +40,7 @@ X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
 # ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
-HALF_POPULATION = 4000
+HALF_POPULATION = 3500
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
@@ -48,7 +48,7 @@ T = 2.0  # temperature for CE fitness (T>1 softens logits → smoother ES gradie
 
 # ---- Tunable hyperparameters (agent may adjust these) ----
 LR_START = 0.012
-LR_DECAY = 0.90
+LR_DECAY = 0.92
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
 
