@@ -6,11 +6,11 @@ Evolution Strategies training of a 784→128→128→10 MLP on MNIST, using a fu
 
 Same architecture, same GPU (RTX 4080 SUPER), fp32 data, 10 epochs:
 
-| | Backprop | EGGROLL |
-|---|---|---|
-| **Training time** | **1.5s** | **2.16s** |
-| **Test accuracy** | 97.5% | 97.3% |
-| **Peak memory** | 389 MB | 389 MB |
+| | Backprop (optimized) | Backprop (naive) | EGGROLL |
+|---|---|---|---|
+| **Training time** | **1.5s** | 4.5s | **2.16s** |
+| **Test accuracy** | 97.5% | 97.3% | 97.3% |
+| **Peak memory** | 389 MB | 391 MB | 389 MB |
 
 EGGROLL does **3,360x more FLOPs** per batch (1,680 antithetic perturbation pairs × 2 forward passes each, vs 1 forward + 1 backward). The fused Triton kernel compresses this gap to **1.44x wall-clock time**.
 
