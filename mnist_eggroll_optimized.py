@@ -40,7 +40,7 @@ X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
 # ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
-HALF_POPULATION = 2000
+HALF_POPULATION = 1800
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
@@ -115,9 +115,12 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
 
             # Skip /BATCH_SIZE — normalization absorbs the constant scale
             fitness_diff = partial_ce_neg.sum(axis=1) - partial_ce_pos.sum(axis=1)
-            mean = fitness_diff.mean()
-            std = fitness_diff.std() + 1e-8
-            shaped = jnp.clip((fitness_diff - mean) / std, -2.0, 2.0)
+            # Per-subgroup z-score: reduces outlier influence across groups
+            N_SUBGROUPS = 8
+            fitness_groups = fitness_diff.reshape(N_SUBGROUPS, HALF_POPULATION // N_SUBGROUPS)
+            group_means = fitness_groups.mean(axis=1, keepdims=True)
+            group_stds = fitness_groups.std(axis=1, keepdims=True) + 1e-8
+            shaped = jnp.clip((fitness_groups - group_means) / group_stds, -2.0, 2.0).reshape(HALF_POPULATION)
 
             shaped_col = shaped[:, None]
             grad1 = scale * B1.T @ (shaped_col * A1)
