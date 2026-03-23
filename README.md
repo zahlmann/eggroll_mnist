@@ -28,6 +28,12 @@ uv run validate.py                    # eggroll (3-seed validation)
 
 Requires `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/)) and a GPU with ~500MB VRAM.
 
+### Agent-driven optimization
+
+The optimizations were developed using an autonomous coding agent loop, inspired by Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) approach. The agent reads `program.md` (which defines the experiment loop, constraints, and ideas), writes code, benchmarks, keeps or reverts, and iterates.
+
+To reproduce or extend: point a coding agent at `program.md` and let it run. The `cuda_kernels_docs/` directory contains Triton and jax-triton documentation for the agent to reference.
+
 ### What made it fast
 
 The optimization went from **27s to 2.9s** (9.4x speedup). Key optimizations:
@@ -63,12 +69,6 @@ BLOCK_B=16/128, BLOCK_K=64, num_stages=2+, num_warps=2/8, doubly-tiled J+K kerne
 
 **Algorithmic (Sessions 5-6):**
 Rank-based fitness shaping (95.6%), top-k truncation (96.8%), Boltzmann/softmax weighting (86.6%), one-sided ES (needs 2x pop), Rademacher/uniform perturbations, per-layer sigma scaling (hurts L1 gradient), structured perturbations via FWHT (+1.5s JIT), cosine LR (worse than exponential), temperature tuning (marginal), no-shuffle at low pop (costs accuracy), uint8 data transfer (setup hiding — reverted).
-
-### Agent-driven optimization
-
-The optimizations were developed using an autonomous coding agent loop, inspired by Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) approach. The agent reads `program.md` (which defines the experiment loop, constraints, and ideas), writes code, benchmarks, keeps or reverts, and iterates.
-
-To reproduce or extend: point a coding agent at `program.md` and let it run. The `cuda_kernels_docs/` directory contains Triton and jax-triton documentation for the agent to reference.
 
 ### Background
 
