@@ -9,6 +9,7 @@ if "--xla_gpu_enable_triton_gemm" not in os.environ["XLA_FLAGS"]:
     os.environ["XLA_FLAGS"] += " --xla_gpu_enable_triton_gemm=false"
 
 import time
+import threading
 import argparse
 import numpy as np
 import jax
@@ -190,14 +191,35 @@ def main():
     print("Training...")
     start_time = time.perf_counter()
 
-    # Shuffle once on CPU, group, and transfer to GPU (included in timing)
+    # Overlap JIT compilation with data transfer:
+    # 1. CPU shuffle (fast)
     rng = np.random.default_rng(args.seed)
     n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
     perm = rng.permutation(X_train_np.shape[0])
-    X_grouped = jnp.array(X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1))
-    y_grouped = jnp.array(y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE))
+    X_shuffled = X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)
+    y_shuffled = y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE)
 
-    w1, w2, w3 = train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key)
+    # 2. Start data transfer in background thread
+    transfer_result = {}
+    def _transfer():
+        transfer_result['X'] = jnp.array(X_shuffled)
+        transfer_result['y'] = jnp.array(y_shuffled)
+    transfer_thread = threading.Thread(target=_transfer)
+    transfer_thread.start()
+
+    # 3. Compile with abstract shapes (overlaps with data transfer, no GPU memory for dummies)
+    abstract_X = jax.ShapeDtypeStruct((N_GROUPS, GROUP_SIZE * BATCH_SIZE, 784), jnp.float32)
+    abstract_y = jax.ShapeDtypeStruct((N_GROUPS, GROUP_SIZE * BATCH_SIZE), jnp.int32)
+    compiled = jax.jit(train_all_epochs).lower(
+        w1, w2, w3, abstract_X, abstract_y, key
+    ).compile()
+
+    # 4. Wait for data transfer and execute
+    transfer_thread.join()
+    X_grouped = transfer_result['X']
+    y_grouped = transfer_result['y']
+
+    w1, w2, w3 = compiled(w1, w2, w3, X_grouped, y_grouped, key)
     jax.block_until_ready(w1)
 
     train_time = time.perf_counter() - start_time
