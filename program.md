@@ -234,10 +234,10 @@ No bf16 data loading tricks — the comparison must be apples-to-apples.
 | Backprop optimized (JAX) | ~1.5s   | ~389MB | ~97.5%   |
 | Backprop naive (JAX)     | ~4.5s   | ~391MB | ~97.3%   |
 | EGGROLL baseline         | ~27.3s  | ~390MB | ~97.6%   |
-| EGGROLL optimized        | ~2.3s   | ~389MB | ~97.3%   |
+| EGGROLL optimized        | ~2.16s  | ~389MB | ~97.3%   |
 | Your target              | ≤3.0s   | ≤500MB | ≥97.2%   |
 
-Current speedup: 12.1x over baseline, 1.5x gap to optimized backprop.
+Current speedup: 12.6x over baseline, 1.44x gap to optimized backprop.
 
 **Population scaling** (measured, Session 7, with XLA triton_gemm=false):
 - HALF_POP=5000: ~5.2s, ~97.4% acc (no smoothing needed)
@@ -246,8 +246,8 @@ Current speedup: 12.1x over baseline, 1.5x gap to optimized backprop.
 - HALF_POP=2250: ~3.3s, ~97.2% acc (σ=0.032, α=0.12 adaptive)
 - HALF_POP=2000: ~3.0s, ~97.3% acc (σ=0.036, α=0.20*0.5^epoch, Winsorized ±2σ)
 - HALF_POP=1800: ~2.4s, ~97.3% acc (K=8 subgroup z-score, triton_gemm=false)
-- HALF_POP=1680: ~2.3s, ~97.3% acc (K=8, α=0.30/0.50, triton_gemm=false, current)
-- HALF_POP=1600: ~2.3s, accuracy unreliable (~97.1% avg, seed 7 fails)
+- HALF_POP=1680: ~2.16s, ~97.3% acc (K=8, α=0.30/0.50, triton_gemm=false, shuffle overlap, current)
+- HALF_POP=1600: ~2.29s, marginal (97.24% avg best config: α=0.35, lr_d=0.90; only 1-2 of 144 configs pass)
 
 JIT time (~0.85s with triton_gemm=false) dominates — pop reduction has diminishing returns.
 
@@ -595,17 +595,62 @@ With triton_gemm=false:
 - Total JIT: 0.69s (in-scan: 0.85s due to scan overhead)
 - Execution per batch: 0.29ms (0.234ms kernel + 0.06ms other)
 
+### Session 8 (2.3s → 2.16s) — data pipeline overlap + extensive exploration
+
+23. **Overlap CPU shuffle with JIT compilation** (2.26s → 2.16s): moved numpy shuffle +
+    GPU transfer into a single background thread that runs during JIT compilation.
+    Both release the GIL so they overlap with the C++ compilation step. Previously
+    shuffle ran sequentially before JIT started, wasting ~0.06-0.09s.
+
+### What did NOT work — Session 8
+
+- **float16 perturbation vectors** (instead of bf16): accuracy drops 0.09pp (97.34 → 97.25%)
+  despite fp16 having 10-bit mantissa vs bf16's 7-bit. The narrower dynamic range
+  (max ~65K vs ~3.4e38) matters more than mantissa precision for the perturbation
+  vectors going through GELU activations.
+
+- **Pop1600 sweep** (144 configs, 3-seed each): only 1-2 configs barely pass (97.20-97.24% avg).
+  The best is σ=0.036, α=0.35, lr_d=0.90 at 97.24% avg. But training time is ~2.29s — actually
+  SLOWER than pop1680 (2.25s) due to slightly different XLA compilation characteristics. Not
+  worth the accuracy risk.
+
+- **Pop1520/1440/1360/1280**: ALL fail 3-seed validation. Best averages: pop1520=97.09%,
+  pop1440=97.11%, pop1360=97.14%. Seed 7 is consistently the weakness.
+
+- **Rank-2 perturbations** (genuinely novel, first-ever test): W_perturbed = W + σ*(outer(Ba,Aa)
+  + outer(Bb,Ab)). Each perturbation explores a 2D subspace instead of 1D. Required correcting
+  the gradient scale from 1/(2σN) to 1/(4σN) — the expectation E[(d/2σ)*ε] = 2∇f for rank-2,
+  not ∇f as for rank-1. Even with correct scale, accuracy caps at 96.7% (pop840) to 96.9%
+  (pop1344). Rank-2 does NOT improve gradient quality per compute — the theoretical 2x variance
+  reduction per perturbation is offset by the structured nature of real gradients. Dead end.
+
+- **Adaptive population schedule** (more pop early, fewer late): dead end in the JAX/scan
+  framework. Each new population size requires recompilation (~0.7s), outweighing the execution
+  savings. Masking within existing grid doesn't save compute (kernel, PRNG, gradient matmuls
+  all process full population regardless of mask).
+
+- **Z-score parameter tuning** (N_SUBGROUPS={4,6,8,10,12}, clip={1.5,1.8,2.0,2.5,3.0}):
+  current config (N_SUBGROUPS=8, clip=2.0) is already optimal at 97.27% avg. All other
+  combinations are strictly worse. Exhaustive 3-seed evaluation confirms.
+
+- **Sigma decay tuning** (σ_decay from 0.998 down to 0.90): stronger decay (0.97) improves
+  seed 11 dramatically (97.46% at pop1600) but hurts seeds 42/7, failing 3-seed validation.
+  The sigma schedule helps specific seeds but doesn't generalize.
+
+- **LR decay tuning** (lr_decay=0.85-0.92): lr_decay=0.90 marginally helps at pop1600
+  (97.24% vs 97.20% with lr_decay=0.88) but doesn't enable lower population.
+
 ## Ideas to try next — Reaching the stretch goal (2.0s)
 
-HALF_POP=1680 with triton_gemm=false + JIT/transfer overlap achieves 2.26s at
-97.27% avg accuracy. To reach 2.0s, need another 0.26s.
+HALF_POP=1680 with triton_gemm=false + full pipeline overlap achieves 2.16s at
+97.27% avg accuracy. To reach 2.0s, need another 0.16s.
 
-### Time budget at pop1680 (2.26s total, with triton_gemm=false):
+### Time budget at pop1680 (2.16s total, with triton_gemm=false + shuffle overlap):
 | Component | Time | % | Notes |
 |-----------|------|---|-------|
-| JIT compilation | ~0.72s | 32% | Overlapped with 0.12s data transfer |
-| Execution | ~1.39s | 62% | Kernel (1.09s) + PRNG/gradient/update (0.30s) |
-| Data prep (CPU) | ~0.06s | 3% | numpy shuffle |
+| JIT compilation | ~0.71s | 33% | Overlapped with shuffle + transfer (~0.18s) |
+| Execution | ~1.39s | 64% | Kernel+setup (1.16s) + PRNG/gradient/update (0.23s) |
+| Data prep (CPU) | ~0.06s | 3% | numpy shuffle (overlapped with JIT) |
 | Data transfer | ~0.12s | 5% | CPU→GPU (overlapped with JIT) |
 
 ### What's already been tried and failed (don't re-test these)
@@ -620,54 +665,43 @@ HALF_POP=1680 with triton_gemm=false + JIT/transfer overlap achieves 2.26s at
 
 ### Promising directions (haven't been tried or only partially explored)
 
-To reach 2.0s from 2.26s, need to save 0.26s. The two pools to draw from:
-- **JIT: 0.72s** (lowering 0.24s + XLA compilation 0.45s)
-- **Execution: 1.39s** (kernel 1.09s + PRNG/gradient/update 0.30s)
+To reach 2.0s from 2.16s, need to save 0.16s. The two pools to draw from:
+- **JIT: 0.71s** (lowering 0.26s + XLA compilation 0.46s)
+- **Execution: 1.39s** (kernel+setup 1.16s + PRNG/gradient/update 0.23s)
 
-**Honest assessment:** most obvious optimizations have been exhausted. The remaining
-ideas are either high-effort/uncertain-reward or require algorithmic breakthroughs.
-Be prepared for diminishing returns.
+**Honest assessment:** Session 8 exhaustively tested all Tier 1 ideas plus rank-2
+perturbations. None provided meaningful improvement. The remaining 0.16s gap requires
+either JAX FFI (high effort, saves ~0.26s lowering) or a genuinely novel algorithmic
+breakthrough that enables pop < 1600 while maintaining 97.2% accuracy.
 
 #### Tier 1: Most likely to help (try these first)
 
-1. **Adaptive population schedule** — use more perturbations in early epochs (noisy
-   gradient), fewer in later epochs (nearly converged). Example: pop2000 epochs 1-3,
-   pop1680 epochs 4-7, pop1200 epochs 8-10. Average pop ~1560, saves ~10% kernel
-   time (~0.11s). This is FAIR: no cross-batch state, just a schedule like LR/sigma
-   decay. Implementation: either recompile the kernel for each pop level (adds JIT
-   for each new grid size — test if the JIT cost is worth it), or pad smaller
-   populations with zeros and mask in the kernel (wastes some compute but avoids
-   recompilation). The masking approach keeps a single compiled kernel.
+~~1. **Adaptive population schedule**~~: DEAD END (Session 8). JAX recompilation
+   cost (~0.7s per new pop size) outweighs execution savings. Masking within
+   existing grid doesn't save compute.
 
-2. **Rank-2 perturbations** — instead of rank-1 perturbations (outer(B, A)), use
-   rank-2: W_perturbed = W + sigma * (outer(B1, A1) + outer(B2, A2)). Each
-   perturbation explores a richer subspace (2D plane vs 1D line), potentially
-   giving better gradient estimates from fewer population members. The cost: more
-   random numbers per perturbation (2x VEC_DIM), but if it enables pop800 instead
-   of pop1680, the net compute drops ~50%. Requires kernel changes to handle
-   two outer products. Not tested in ANY session — genuinely unexplored.
+~~2. **Rank-2 perturbations**~~: DEAD END (Session 8). Accuracy caps at 96.7-96.9%
+   even with correct gradient scale (1/4σN for rank-2). Rank-2 does not improve
+   gradient quality per compute — real gradients are too structured for the
+   theoretical 2x variance reduction to hold.
 
-3. **float16 perturbation vectors for kernel** — currently bf16 (7-bit mantissa).
-   float16 has 10-bit mantissa = 8x more precision. Same tensor core throughput
-   on Ada Lovelace. Could improve accuracy enough to enable lower pop (e.g.,
-   pop1440). Easy change: just replace `jnp.bfloat16` with `jnp.float16` for
-   all_vecs_f casts. Precision rules require fp32 for gradient matmuls (B.T @
-   (shaped * A)) — this only changes the KERNEL input, not the gradient.
+~~3. **float16 perturbation vectors**~~: DEAD END (Session 8). Accuracy drops 0.09pp
+   due to narrower dynamic range (max ~65K vs bf16's ~3.4e38), despite better
+   mantissa precision.
 
-4. **Fresh hyperparameter sweep at pop1440-1600** — Session 7 tested pop1600 with
-   triton_gemm=true numerics. The triton_gemm=false flag changes numerical behavior
-   slightly (different cuBLAS kernels). A fresh sweep might find passing configs.
-   Pop1440 = 18 full CUDA waves (zero tail), saves ~0.12s kernel time. Pop1520 =
-   19 waves. Must divide by N_SUBGROUPS=8: pop1440 (180/group), pop1520 (190/group),
-   pop1600 (200/group).
+~~4. **Pop1440-1600 sweep**~~: DEAD END (Session 8). Exhaustive 3-seed sweep of 144+
+   configs per pop level. Pop1600: only 1-2 configs barely pass at 97.20-97.24%.
+   Pop1520/1440/1360: all fail. Z-score tuning (N_SUBGROUPS, clip range) confirms
+   current config is already optimal.
 
-#### Tier 2: Worth trying but lower probability
+#### The only remaining path to 2.0s
 
 5. **JAX FFI with pre-compiled Triton kernel** — AOT compile the kernel with
    `triton.compile()`, register via `jax.ffi.register_ffi_target` + C++ wrapper.
-   Saves ~0.24s lowering time. HIGH EFFORT: requires C++ shared library with XLA
-   FFI handler, CMake build, linking against CUDA driver API and XLA headers. No
-   published examples of the full Triton→FFI pipeline. Research confirmed feasible.
+   Saves ~0.26s lowering time (bringing 2.16s → ~1.90s, BELOW 2.0s target).
+   HIGH EFFORT: requires C++ shared library with XLA FFI handler, CMake build,
+   linking against CUDA driver API and XLA headers. No published examples of
+   the full Triton→FFI pipeline. Research confirmed feasible.
    See `jax/examples/ffi/` and `triton.compile()` API.
 
 6. **Persistent Triton kernel** — launch 80 persistent blocks (one per SM) that
