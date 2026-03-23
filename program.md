@@ -637,9 +637,9 @@ To reach 2.0s from 2.26s, need to save 0.26s. The two pools to draw from:
      slice operations on all_vecs into fewer ops, or use a simpler PRNG that
      generates fewer HLO ops (counter-based was tried but didn't help; may be
      worth retrying now that triton_gemm=false changes the compilation profile).
-   - **Pallas kernel rewrite**: won't help JIT much (bridge is only 0.03s), but
-     Pallas might generate different Triton IR that XLA compiles faster, or that
-     executes faster. Worth testing if other approaches fail.
+   - ~~**Pallas kernel rewrite**~~: won't help. Bridge is only 0.03s, and Pallas
+     generates the same Triton IR underneath. Research confirmed no JIT or
+     execution benefit. Don't try.
 
 2. **Further population reduction** (target: pop1440 = 18 waves, saves ~0.12s exec):
    Pop1600 fails at 97.1% avg. Pop1440 would save ~14% of kernel time. Ideas:
@@ -690,11 +690,10 @@ To reach 2.0s from 2.26s, need to save 0.26s. The two pools to draw from:
      A batched matmul or concatenated approach might reduce launch overhead.
      Session 7 tested concat-A approach (0.075ms vs 0.081ms) — marginal. But
      a Triton gradient kernel could be faster by avoiding cuBLAS entirely.
-   - **Reduce bf16 cast overhead**: w1/w2/w3 are cast to bf16 every batch, but
-     only change by a small gradient update. Could maintain a bf16 shadow copy
-     that's updated alongside the fp32 weights, avoiding the full cast. The
-     shadow copy would be: `w1_f = (w1_f + (lr * grad1).astype(bf16))` — but
-     this changes the numerical path slightly and needs accuracy verification.
+   - ~~**bf16 shadow weights**~~: maintaining a bf16 copy updated in bf16 would
+     violate precision rules ("weight storage and updates" must be fp32). The
+     per-batch bf16 cast is a necessary cost. XLA likely already fuses the cast
+     with the subsequent matmul, so the overhead is minimal anyway.
 
 ### What NOT to try (forbidden by fairness rules)
 - ~~Momentum / EMA of gradients~~: unfair, backprop SGD is stateless
