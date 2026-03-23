@@ -395,14 +395,12 @@ PRNG ops are NOT the compilation bottleneck.
 
 At HALF_POP=2000 with adaptive smoothing + Winsorized z-score + uint8 transfer:
 
-### Component breakdown (3.0s total)
+### Component breakdown (2.9s total, pop1800)
 | Component | Time | % | Notes |
 |-----------|------|---|-------|
-| JIT compilation | ~1.6s | 53% | XLA + jax-triton serialization |
-| Triton kernel | ~1.16s | 39% | 2000×2×2 = 8K blocks per batch |
-| Random generation | ~0.05s | 2% | jax.random.normal (2000×1306) |
-| Gradient matmuls | ~0.11s | 4% | B.T @ (shaped * A) for 3 layers |
-| Data prep | ~0.07s | 2% | CPU shuffle (uint8) + GPU transfer + float32 convert |
+| JIT compilation | ~1.46s | 50% | XLA + jax-triton serialization |
+| Execution (all) | ~1.28s | 44% | Triton kernel + random + gradient + weight updates |
+| Data prep | ~0.16s | 6% | CPU shuffle (uint8) + GPU transfer + float32 convert |
 
 The kernel achieves ~12% of FP8 peak throughput at 25% occupancy (4 blocks/SM,
 limited by ~113 registers/thread). JIT is dominated by jax-triton bridge serialization.
@@ -494,6 +492,13 @@ is now explicitly forbidden in the rules above.
 19. **uint8 data transfer** (saves ~0.1s): store training data as uint8 in CPU memory,
     transfer 4x smaller buffer to GPU, convert to float32 on GPU. MNIST pixels are
     exactly representable as uint8/255. Training computation is still fp32.
+
+20. **Per-subgroup z-score** (K=8 groups, enables pop1800): instead of one global
+    z-score over all perturbation fitness differences, split into 8 groups of 225
+    and z-score each independently. This reduces outlier influence even more than
+    global Winsorized clipping, giving ~0.06pp accuracy boost at pop1800 (97.27%
+    vs 97.20% without subgroups). Combined with ±2.0 clipping. Must use K that
+    divides HALF_POPULATION evenly.
 
 ### What did NOT work — Session 6
 - **Per-layer sigma scaling** (scaling A vectors by per-layer factors): ALL configs
