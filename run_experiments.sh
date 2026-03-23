@@ -1,18 +1,21 @@
 #!/bin/bash
-set -e # Exit on error
+set -e
 
-echo "Checking data..."
 if [ ! -f "mnist_prepped_float.npz" ]; then
     echo "Data not found. Running data prep..."
     uv run mnist_data_prep.py
-else
-    echo "Data already exists. Skipping data prep."
 fi
 
-echo "Running EGGROLL..."
+echo "=== EGGROLL ==="
 uv run mnist_eggroll_optimized.py
 
-echo "Running Backpropagation..."
+echo ""
+echo "=== Backprop (optimized) ==="
+uv run mnist_backprop_optimized.py
+
+echo ""
+echo "=== Backprop (naive) ==="
 uv run mnist_backprop.py
 
+echo ""
 echo "All experiments finished."
