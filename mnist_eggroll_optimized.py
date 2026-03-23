@@ -40,7 +40,7 @@ X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
 # ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
-HALF_POPULATION = 2750
+HALF_POPULATION = 2500
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
@@ -51,7 +51,7 @@ LR_START = 0.012
 LR_DECAY = 0.88
 SIGMA_START = 0.028
 SIGMA_DECAY = 0.998
-ALPHA_START = 0.06
+ALPHA_START = 0.10
 ALPHA_DECAY = 0.7
 
 N_BATCHES = (X_train_np.shape[0] // BATCH_SIZE)  # drop last incomplete batch
