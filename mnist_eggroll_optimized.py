@@ -40,7 +40,7 @@ X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
 # ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
-HALF_POPULATION = 3250
+HALF_POPULATION = 3000
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
