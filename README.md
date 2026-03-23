@@ -8,14 +8,14 @@ Same architecture (784-128-128-10 MLP, GELU, 10 epochs), same GPU (RTX 4080 SUPE
 
 | | Backprop (optimized) | Backprop (naive) | EGGROLL |
 |---|---|---|---|
-| **Training time** | **1.5s** | 4.5s | **2.3s** |
+| **Training time** | **1.5s** | 4.5s | **2.16s** |
 | **Per-epoch compute** | 0.03s | 0.2s | **0.14s** |
 | **Test accuracy** | 97.5% | 97.3% | 97.3% |
 | **Peak memory** | 389 MB | 391 MB | 389 MB |
 
 Both JAX implementations use `jax.lax.scan` + all-in-one JIT. The naive backprop uses Python loops with per-batch GPU synchronization, which inflates its time 3x.
 
-EGGROLL is **1.5x slower** than optimized backprop at equal optimization level. It does **3,360x more FLOPs** per batch (3,360 forward passes via 1,680 antithetic perturbation pairs vs 1 forward + 1 backward). The fused Triton kernel with FP8 tensor cores compresses this compute gap from 3360x to 1.5x.
+EGGROLL is **1.44x slower** than optimized backprop at equal optimization level. It does **3,360x more FLOPs** per batch (3,360 forward passes via 1,680 antithetic perturbation pairs vs 1 forward + 1 backward). The fused Triton kernel with FP8 tensor cores compresses this compute gap from 3360x to 1.44x.
 
 ### How to run
 
@@ -36,7 +36,7 @@ To reproduce or extend: point a coding agent at `program.md` and let it run. The
 
 ### What made it fast
 
-The optimization went from **27s to 2.3s** (12.1x speedup). Key optimizations:
+The optimization went from **27s to 2.16s** (12.5x speedup). Key optimizations:
 
 **Sessions 1-4: Kernel + compilation (27s -> 5.2s)**
 
@@ -68,6 +68,10 @@ The optimization went from **27s to 2.3s** (12.1x speedup). Key optimizations:
 
 13. **JIT/data transfer overlap** — abstract shape lowering (`jax.ShapeDtypeStruct`) allows JIT compilation to start without GPU memory allocation while data transfers in a background thread.
 
+**Session 8: Pipeline overlap (2.3s -> 2.16s)**
+
+14. **CPU shuffle + transfer overlap with JIT** — moved numpy shuffle and GPU transfer into a single background thread that runs during JIT compilation. Both release the GIL so they overlap with C++ compilation.
+
 See `kernels/fused_3layer_ce.py` and `program.md` for the full optimization log.
 
 ### What didn't work
@@ -80,6 +84,9 @@ Rank-based fitness shaping (95.6%), top-k truncation (96.8%), Boltzmann/softmax 
 
 **Session 7:**
 Pure JAX forward (4.6x slower), Python loop (dispatch overhead), pop1600 (accuracy unreliable), shared perturbation vectors (94.5% acc), ReLU activation (forbidden), 10+ XLA flags, all kernel tuning configs, pre-split epoch keys (hurt accuracy), GPU-side batch shuffle (memory over limit).
+
+**Session 8:**
+float16 perturbation vectors (accuracy drops 0.09pp), pop1600 sweep (144 configs, barely passes), pop1520/1440/1360 (all fail accuracy), rank-2 perturbations (96.7-96.9% accuracy — doesn't help), adaptive population schedule (JIT cost kills savings), z-score parameter tuning (current config already optimal), sigma/LR decay sweep (no improvement).
 
 ### Background
 
