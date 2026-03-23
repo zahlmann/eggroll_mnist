@@ -70,7 +70,7 @@ GROUP_SIZE = 1  # each ES gradient step uses one batch (fair: same as backprop b
 N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 groups
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4))
 def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
     """Train all epochs in a single JIT call — eliminates Python loop overhead."""
 
@@ -78,9 +78,6 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
         w1, w2, w3, key, sigma, lr, alpha = carry
 
         key, epoch_rng_key = jax.random.split(key)
-
-        X_shuf = X_grouped
-        y_shuf = y_grouped
 
         sigma_f32 = jnp.float32(sigma)
         T_f32 = jnp.float32(T)
@@ -142,7 +139,7 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
 
             return (w1, w2, w3, batch_idx + 1), None
 
-        (w1, w2, w3, _), _ = jax.lax.scan(batch_step, (w1, w2, w3, jnp.int32(0)), (X_shuf, y_shuf))
+        (w1, w2, w3, _), _ = jax.lax.scan(batch_step, (w1, w2, w3, jnp.int32(0)), (X_grouped, y_grouped))
 
         sigma = sigma * SIGMA_DECAY
         lr = lr * LR_DECAY
