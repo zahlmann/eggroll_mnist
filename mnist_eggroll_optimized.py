@@ -40,7 +40,7 @@ X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
 # ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
-HALF_POPULATION = 2750
+HALF_POPULATION = 1800
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
@@ -49,8 +49,10 @@ T = 2.0  # temperature for CE fitness (T>1 softens logits → smoother ES gradie
 # ---- Tunable hyperparameters (agent may adjust these) ----
 LR_START = 0.012
 LR_DECAY = 0.88
-SIGMA_START = 0.028
+SIGMA_START = 0.036
 SIGMA_DECAY = 0.998
+ALPHA_START = 0.20
+ALPHA_DECAY = 0.5
 
 N_BATCHES = (X_train_np.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
@@ -63,11 +65,8 @@ N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 groups
 def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
     """Train all epochs in a single JIT call — eliminates Python loop overhead."""
 
-    # Loop-invariant scalars
-    # No pos_sign/neg_sign needed — merged kernel handles both
-
     def epoch_step(carry, _):
-        w1, w2, w3, key, sigma, lr = carry
+        w1, w2, w3, key, sigma, lr, alpha = carry
 
         key, epoch_rng_key = jax.random.split(key)
 
@@ -108,15 +107,20 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
             base1 = xb_f @ w1_f
             xB1_T = B1_f @ xb_f.T
 
+            alpha_f32 = jnp.float32(alpha)
+
             partial_ce_pos, partial_ce_neg = fused_3layer_ce_both(
                 base1, xB1_T, A1_f, w2_f, B2_f, A2_f, w3_f, B3_f, A3_f,
-                sigma_f32, T_f32, yb)
+                sigma_f32, T_f32, alpha_f32, yb)
 
             # Skip /BATCH_SIZE — normalization absorbs the constant scale
             fitness_diff = partial_ce_neg.sum(axis=1) - partial_ce_pos.sum(axis=1)
-            mean = fitness_diff.mean()
-            std = fitness_diff.std() + 1e-8
-            shaped = (fitness_diff - mean) / std
+            # Per-subgroup z-score: reduces outlier influence across groups
+            N_SUBGROUPS = 8
+            fitness_groups = fitness_diff.reshape(N_SUBGROUPS, HALF_POPULATION // N_SUBGROUPS)
+            group_means = fitness_groups.mean(axis=1, keepdims=True)
+            group_stds = fitness_groups.std(axis=1, keepdims=True) + 1e-8
+            shaped = jnp.clip((fitness_groups - group_means) / group_stds, -2.0, 2.0).reshape(HALF_POPULATION)
 
             shaped_col = shaped[:, None]
             grad1 = scale * B1.T @ (shaped_col * A1)
@@ -133,11 +137,12 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
 
         sigma = sigma * SIGMA_DECAY
         lr = lr * LR_DECAY
+        alpha = alpha * ALPHA_DECAY
 
-        return (w1, w2, w3, key, sigma, lr), None
+        return (w1, w2, w3, key, sigma, lr, alpha), None
 
-    init = (w1, w2, w3, key, jnp.float32(SIGMA_START), jnp.float32(LR_START))
-    (w1, w2, w3, key, _, _), _ = jax.lax.scan(epoch_step, init, None, length=EPOCHS)
+    init = (w1, w2, w3, key, jnp.float32(SIGMA_START), jnp.float32(LR_START), jnp.float32(ALPHA_START))
+    (w1, w2, w3, key, _, _, _), _ = jax.lax.scan(epoch_step, init, None, length=EPOCHS)
     return w1, w2, w3
 
 

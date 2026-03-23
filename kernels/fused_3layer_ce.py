@@ -103,7 +103,7 @@ def _fused_3layer_ce_both_kernel(
     base1_ptr, xB1_T_ptr, A1_ptr,
     w2_ptr, B2_ptr, A2_ptr,
     w3_ptr, B3_ptr, A3_ptr,
-    sigma_ptr, T_ptr,
+    sigma_ptr, T_ptr, smooth_alpha_ptr,
     y_ptr,
     partial_ce_pos_ptr, partial_ce_neg_ptr,
     HALF_POP: tl.constexpr, BATCH: tl.constexpr, HIDDEN: tl.constexpr,
@@ -124,6 +124,7 @@ def _fused_3layer_ce_both_kernel(
 
     sigma = tl.load(sigma_ptr).to(tl.float32)
     T_val = tl.load(T_ptr).to(tl.float32)
+    alpha = tl.load(smooth_alpha_ptr).to(tl.float32)
     sign = tl.where(pid_sign == 0, 1.0, -1.0)
     sign_sigma = sign * sigma
 
@@ -180,7 +181,7 @@ def _fused_3layer_ce_both_kernel(
     log_sm = scaled - max_val - tl.log(tl.sum(exp_val, axis=1)[:, None])
 
     one_hot = (tl.arange(0, OUT_DIM_PAD)[None, :] == y_labels[:, None]).to(tl.float32)
-    smooth = 0.98 * one_hot + 0.02 / 10.0
+    smooth = (1.0 - alpha) * one_hot + alpha / 10.0
     smooth = tl.where(tl.arange(0, OUT_DIM_PAD)[None, :] >= OUT_DIM, 0.0, smooth)
     ce = -tl.sum(log_sm * smooth, axis=1)
     ce = tl.where(mask_b, ce, 0.0)
@@ -221,7 +222,7 @@ def fused_3layer_ce(base1, xB1_T, A1, w2, B2, A2, w3, B3, A3, sigma, T_val, sign
     )
 
 
-def fused_3layer_ce_both(base1, xB1_T, A1, w2, B2, A2, w3, B3, A3, sigma, T_val, y):
+def fused_3layer_ce_both(base1, xB1_T, A1, w2, B2, A2, w3, B3, A3, sigma, T_val, smooth_alpha, y):
     """Compute BOTH pos and neg CE in a single kernel call."""
     HALF_POP, BATCH = xB1_T.shape
     _, HIDDEN = base1.shape
@@ -244,7 +245,7 @@ def fused_3layer_ce_both(base1, xB1_T, A1, w2, B2, A2, w3, B3, A3, sigma, T_val,
         base1, xB1_T, A1,
         w2, B2, A2,
         w3_pad, B3, A3_pad,
-        sigma, T_val,
+        sigma, T_val, smooth_alpha,
         y.astype(jnp.int32),
         kernel=_fused_3layer_ce_both_kernel,
         out_shape=out_shape,
