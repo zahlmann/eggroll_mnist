@@ -624,76 +624,83 @@ To reach 2.0s from 2.26s, need to save 0.26s. The two pools to draw from:
 - **JIT: 0.72s** (lowering 0.24s + XLA compilation 0.45s)
 - **Execution: 1.39s** (kernel 1.09s + PRNG/gradient/update 0.30s)
 
-1. **Reducing JIT further** (target: save ≥0.1s from 0.72s):
-   - **JAX FFI with pre-compiled Triton kernel**: use `triton.compile()` to AOT
-     compile the kernel to cubin, then register via `jax.ffi.register_ffi_target`
-     + a thin C++ wrapper using `cuModuleLoadData`/`cuLaunchKernel`. This bypasses
-     the jax-triton Python lowering entirely (~0.24s lowering → ~0s). Requires
-     writing a C++ shared library with XLA FFI handler. See `jax/examples/ffi/`
-     in the JAX repo for the pattern. Session 7 research confirmed this is feasible
-     but no published examples exist for the full Triton→FFI pipeline.
-   - **Simplify HLO graph**: the scan body has ~970 HLO lines. Ideas: reduce
-     the number of bf16 casts (cast once outside batch loop if possible), merge
-     slice operations on all_vecs into fewer ops, or use a simpler PRNG that
-     generates fewer HLO ops (counter-based was tried but didn't help; may be
-     worth retrying now that triton_gemm=false changes the compilation profile).
-   - ~~**Pallas kernel rewrite**~~: won't help. Bridge is only 0.03s, and Pallas
-     generates the same Triton IR underneath. Research confirmed no JIT or
-     execution benefit. Don't try.
+**Honest assessment:** most obvious optimizations have been exhausted. The remaining
+ideas are either high-effort/uncertain-reward or require algorithmic breakthroughs.
+Be prepared for diminishing returns.
 
-2. **Further population reduction** (target: pop1440 = 18 waves, saves ~0.12s exec):
-   Pop1600 fails at 97.1% avg. Pop1440 would save ~14% of kernel time. Ideas:
-   - **Control variates**: compute unperturbed loss (one extra forward pass per
-     batch, ~0.01ms) and subtract from each perturbed loss before z-scoring. This
-     reduces variance of the gradient estimator, potentially enabling lower pop.
-     The unperturbed forward pass is just `fast_gelu(fast_gelu(xb @ w1) @ w2) @ w3`
-     — fast because it's a single forward pass, not 1680 perturbations.
-   - **Perturbation variance scaling by layer dimension**: scale each layer's
-     perturbation vectors by `1/sqrt(param_count)` to equalize gradient SNR.
-     L1 has 100K params, L3 has 1.3K — the per-perturbation gradient SNR differs
-     by ~9x. Normalizing could improve gradient quality. Note: per-layer SIGMA
-     scaling was tried and failed, but this is different — it adjusts the random
-     vector magnitude BEFORE multiplying by sigma, preserving the same sigma
-     for all layers.
-   - **Guided subspace perturbations**: use SVD of the weight matrices to identify
-     the top-k singular directions, then bias perturbations toward those directions.
-     This focuses perturbation "budget" on dimensions that matter. Would require
-     computing SVD once per epoch (or less frequently) — check if SVD cost is
-     acceptable and if it violates the no-cross-batch-state rule.
-   - **Aggressive hyperparameter search at pop1440/1520/1600**: Session 7 tested
-     ~120 configs at pop1600 but only with triton_gemm=true numerics. The
-     triton_gemm=false flag slightly changes numerical behavior. A fresh sweep
-     at pop1440-1600 with the current code might find passing configs.
+#### Tier 1: Most likely to help (try these first)
 
-3. **Reducing kernel execution time** (target: save ≥0.15s from 1.09s):
-   Kernel at 12% of FP8 peak, 25% occupancy (4 blocks/SM, ~113 regs/thread).
-   - **Warp specialization**: Triton 3.0+ supports `tl.async_task` for splitting
-     work across warps. One warp group loads data while another computes. Could
-     improve occupancy without reducing register pressure.
-   - **Persistent kernels**: instead of launching 6720 short-lived blocks, launch
-     80 persistent blocks (one per SM) that loop over population members. Reduces
-     kernel launch overhead and improves L2 cache reuse of shared data (w2, w3).
-     Triton supports persistent kernels via `tl.num_programs()`.
-   - **Multi-query batching**: multiple perturbations share the same base1/w2/w3.
-     Currently each block loads w2 independently (128×128 bf16 = 32KB). If
-     neighboring blocks in the population dimension share w2 via L2 cache, the
-     effective bandwidth increases. Reordering the grid to (N_TILES, HALF_POP, 2)
-     instead of (HALF_POP, N_TILES, 2) might improve L2 reuse.
-   - **Fuse fitness z-score into Triton kernel**: currently the kernel outputs
-     partial CE values (HALF_POP × N_TILES), then JAX code sums, z-scores, and
-     clips. Fusing the sum + z-score + clip into the kernel would eliminate one
-     round-trip to HBM. Requires a cooperative reduction across blocks (or a
-     second small kernel).
+1. **Adaptive population schedule** — use more perturbations in early epochs (noisy
+   gradient), fewer in later epochs (nearly converged). Example: pop2000 epochs 1-3,
+   pop1680 epochs 4-7, pop1200 epochs 8-10. Average pop ~1560, saves ~10% kernel
+   time (~0.11s). This is FAIR: no cross-batch state, just a schedule like LR/sigma
+   decay. Implementation: either recompile the kernel for each pop level (adds JIT
+   for each new grid size — test if the JIT cost is worth it), or pad smaller
+   populations with zeros and mask in the kernel (wastes some compute but avoids
+   recompilation). The masking approach keeps a single compiled kernel.
 
-4. **Reducing other execution overhead** (target: save ~0.05s from 0.30s):
-   - **Fuse gradient matmuls**: currently 3 separate cuBLAS calls for grad1/2/3.
-     A batched matmul or concatenated approach might reduce launch overhead.
-     Session 7 tested concat-A approach (0.075ms vs 0.081ms) — marginal. But
-     a Triton gradient kernel could be faster by avoiding cuBLAS entirely.
-   - ~~**bf16 shadow weights**~~: maintaining a bf16 copy updated in bf16 would
-     violate precision rules ("weight storage and updates" must be fp32). The
-     per-batch bf16 cast is a necessary cost. XLA likely already fuses the cast
-     with the subsequent matmul, so the overhead is minimal anyway.
+2. **Rank-2 perturbations** — instead of rank-1 perturbations (outer(B, A)), use
+   rank-2: W_perturbed = W + sigma * (outer(B1, A1) + outer(B2, A2)). Each
+   perturbation explores a richer subspace (2D plane vs 1D line), potentially
+   giving better gradient estimates from fewer population members. The cost: more
+   random numbers per perturbation (2x VEC_DIM), but if it enables pop800 instead
+   of pop1680, the net compute drops ~50%. Requires kernel changes to handle
+   two outer products. Not tested in ANY session — genuinely unexplored.
+
+3. **float16 perturbation vectors for kernel** — currently bf16 (7-bit mantissa).
+   float16 has 10-bit mantissa = 8x more precision. Same tensor core throughput
+   on Ada Lovelace. Could improve accuracy enough to enable lower pop (e.g.,
+   pop1440). Easy change: just replace `jnp.bfloat16` with `jnp.float16` for
+   all_vecs_f casts. Precision rules require fp32 for gradient matmuls (B.T @
+   (shaped * A)) — this only changes the KERNEL input, not the gradient.
+
+4. **Fresh hyperparameter sweep at pop1440-1600** — Session 7 tested pop1600 with
+   triton_gemm=true numerics. The triton_gemm=false flag changes numerical behavior
+   slightly (different cuBLAS kernels). A fresh sweep might find passing configs.
+   Pop1440 = 18 full CUDA waves (zero tail), saves ~0.12s kernel time. Pop1520 =
+   19 waves. Must divide by N_SUBGROUPS=8: pop1440 (180/group), pop1520 (190/group),
+   pop1600 (200/group).
+
+#### Tier 2: Worth trying but lower probability
+
+5. **JAX FFI with pre-compiled Triton kernel** — AOT compile the kernel with
+   `triton.compile()`, register via `jax.ffi.register_ffi_target` + C++ wrapper.
+   Saves ~0.24s lowering time. HIGH EFFORT: requires C++ shared library with XLA
+   FFI handler, CMake build, linking against CUDA driver API and XLA headers. No
+   published examples of the full Triton→FFI pipeline. Research confirmed feasible.
+   See `jax/examples/ffi/` and `triton.compile()` API.
+
+6. **Persistent Triton kernel** — launch 80 persistent blocks (one per SM) that
+   loop over population members instead of 6720 short-lived blocks. In theory
+   improves L2 cache reuse of w2/w3 (32KB + 4KB). In practice, w2/w3 probably
+   already fit in L2 cache with the current launch pattern, so benefit is uncertain.
+   Triton supports this via `tl.num_programs()`. Easy to test.
+
+7. **Control variates for gradient variance reduction** — compute unperturbed loss
+   per batch (one extra forward pass, ~0.01ms) and subtract from each perturbed
+   loss before z-scoring. Reduces gradient variance. BUT: the antithetic trick
+   already cancels the zero-order term (fitness_diff = CE(-σ) - CE(+σ)), so
+   control variates may provide little additional benefit. Low probability of
+   enabling significant pop reduction.
+
+#### Directions that sound good but probably won't work
+
+- ~~**Perturbation variance scaling by 1/sqrt(dim)**~~: too similar to per-layer
+  sigma scaling which catastrophically failed. The math is slightly different
+  (scaling vectors before sigma multiply) but the effect on gradient SNR is similar.
+- ~~**Guided subspace perturbations (SVD)**~~: SVD of current weights tells you where
+  weights ARE, not where they SHOULD GO. Perturbing along existing singular
+  directions reinforces the current solution rather than exploring new ones.
+  Also borderline on no-cross-batch-state rule.
+- ~~**Fuse z-score into kernel**~~: data is tiny (1680 × 2 floats = 13KB). HBM
+  round-trip at 700 GB/s takes ~0.02μs. Not worth the complexity.
+- ~~**Grid reordering**~~: GPU scheduler already handles L2 cache locality. w2/w3
+  (36KB total) easily fit in 64MB L2 cache regardless of block scheduling order.
+- ~~**Gradient matmul fusion**~~: tested, saves 0.03s total. Not worth complexity.
+- ~~**Pallas**~~: same Triton IR underneath, no benefit.
+- ~~**bf16 shadow weights**~~: violates precision rules.
+- ~~**Simplify HLO**~~: counter-based PRNG already tested, didn't help. bf16 casts
+  can't be hoisted out of batch loop (weights change each batch).
 
 ### What NOT to try (forbidden by fairness rules)
 - ~~Momentum / EMA of gradients~~: unfair, backprop SGD is stateless
