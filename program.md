@@ -244,9 +244,9 @@ Current speedup: 9.4x over baseline, 1.9x gap to optimized backprop.
 - HALF_POP=2750: ~3.7s, ~97.2% acc (constant α=0.02)
 - HALF_POP=2500: ~3.5s, ~97.2% acc (adaptive α=0.10*0.7^epoch)
 - HALF_POP=2250: ~3.3s, ~97.2% acc (σ=0.032, α=0.12 adaptive)
-- HALF_POP=2000: ~3.0s, ~97.3% acc (σ=0.036, α=0.20*0.5^epoch, Winsorized ±2σ, uint8 transfer)
-- HALF_POP=1850: ~2.9s, ~97.2% acc (marginal, passes ~60% of validation runs)
-- HALF_POP=1750: ~2.8s, ~97.1% acc (fails validation reliably)
+- HALF_POP=2000: ~3.0s, ~97.3% acc (σ=0.036, α=0.20*0.5^epoch, Winsorized ±2σ)
+- HALF_POP=1800: ~2.9s, ~97.3% acc (K=8 subgroup z-score, current)
+- HALF_POP=1600: ~2.7s est., accuracy fails all configs (~97.1%)
 
 The kernel time scales roughly linearly with HALF_POP. JIT time (~1.6s) is constant.
 
@@ -391,16 +391,16 @@ The HLO graph has ~1270 ops, of which 338 (27%) are threefry PRNG bit operations
 but replacing PRNG with counter-based hashing (~30 ops) didn't reduce JIT. The
 PRNG ops are NOT the compilation bottleneck.
 
-## Time budget breakdown (where 3.0s goes) — updated Session 6
+## Time budget breakdown (where 2.9s goes) — updated Session 6
 
-At HALF_POP=2000 with adaptive smoothing + Winsorized z-score + uint8 transfer:
+At HALF_POP=1800 with adaptive smoothing + subgroup Winsorized z-score:
 
 ### Component breakdown (2.9s total, pop1800)
 | Component | Time | % | Notes |
 |-----------|------|---|-------|
 | JIT compilation | ~1.46s | 50% | XLA + jax-triton serialization |
 | Execution (all) | ~1.28s | 44% | Triton kernel + random + gradient + weight updates |
-| Data prep | ~0.16s | 6% | CPU shuffle (uint8) + GPU transfer + float32 convert |
+| Data prep | ~0.16s | 6% | CPU shuffle (fp32) + GPU transfer |
 
 The kernel achieves ~12% of FP8 peak throughput at 25% occupancy (4 blocks/SM,
 limited by ~113 registers/thread). JIT is dominated by jax-triton bridge serialization.
