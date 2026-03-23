@@ -1,6 +1,15 @@
 import os
 import sys
+
+# Disable XLA's Triton GEMM autotuner — cuBLAS fallback gives identical matmul
+# results but avoids ~0.6s of kernel autotuning during JIT compilation.
+# Must be set before importing JAX.
+os.environ.setdefault("XLA_FLAGS", "")
+if "--xla_gpu_enable_triton_gemm" not in os.environ["XLA_FLAGS"]:
+    os.environ["XLA_FLAGS"] += " --xla_gpu_enable_triton_gemm=false"
+
 import time
+import threading
 import argparse
 import numpy as np
 import jax
@@ -40,7 +49,7 @@ X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
 # ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
-HALF_POPULATION = 1800
+HALF_POPULATION = 1680
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
@@ -51,8 +60,8 @@ LR_START = 0.012
 LR_DECAY = 0.88
 SIGMA_START = 0.036
 SIGMA_DECAY = 0.998
-ALPHA_START = 0.20
-ALPHA_DECAY = 0.5
+ALPHA_START = 0.30
+ALPHA_DECAY = 0.50
 
 N_BATCHES = (X_train_np.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
@@ -61,7 +70,7 @@ GROUP_SIZE = 1  # each ES gradient step uses one batch (fair: same as backprop b
 N_GROUPS = N_BATCHES // GROUP_SIZE  # 468 groups
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4))
 def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
     """Train all epochs in a single JIT call — eliminates Python loop overhead."""
 
@@ -69,9 +78,6 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
         w1, w2, w3, key, sigma, lr, alpha = carry
 
         key, epoch_rng_key = jax.random.split(key)
-
-        X_shuf = X_grouped
-        y_shuf = y_grouped
 
         sigma_f32 = jnp.float32(sigma)
         T_f32 = jnp.float32(T)
@@ -133,7 +139,7 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
 
             return (w1, w2, w3, batch_idx + 1), None
 
-        (w1, w2, w3, _), _ = jax.lax.scan(batch_step, (w1, w2, w3, jnp.int32(0)), (X_shuf, y_shuf))
+        (w1, w2, w3, _), _ = jax.lax.scan(batch_step, (w1, w2, w3, jnp.int32(0)), (X_grouped, y_grouped))
 
         sigma = sigma * SIGMA_DECAY
         lr = lr * LR_DECAY
@@ -182,14 +188,35 @@ def main():
     print("Training...")
     start_time = time.perf_counter()
 
-    # Shuffle once on CPU, group, and transfer to GPU (included in timing)
+    # Overlap JIT compilation with data transfer:
+    # 1. CPU shuffle (fast)
     rng = np.random.default_rng(args.seed)
     n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
     perm = rng.permutation(X_train_np.shape[0])
-    X_grouped = jnp.array(X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1))
-    y_grouped = jnp.array(y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE))
+    X_shuffled = X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)
+    y_shuffled = y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE)
 
-    w1, w2, w3 = train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key)
+    # 2. Start data transfer in background thread
+    transfer_result = {}
+    def _transfer():
+        transfer_result['X'] = jnp.array(X_shuffled)
+        transfer_result['y'] = jnp.array(y_shuffled)
+    transfer_thread = threading.Thread(target=_transfer)
+    transfer_thread.start()
+
+    # 3. Compile with abstract shapes (overlaps with data transfer, no GPU memory for dummies)
+    abstract_X = jax.ShapeDtypeStruct((N_GROUPS, GROUP_SIZE * BATCH_SIZE, 784), jnp.float32)
+    abstract_y = jax.ShapeDtypeStruct((N_GROUPS, GROUP_SIZE * BATCH_SIZE), jnp.int32)
+    compiled = jax.jit(train_all_epochs).lower(
+        w1, w2, w3, abstract_X, abstract_y, key
+    ).compile()
+
+    # 4. Wait for data transfer and execute
+    transfer_thread.join()
+    X_grouped = transfer_result['X']
+    y_grouped = transfer_result['y']
+
+    w1, w2, w3 = compiled(w1, w2, w3, X_grouped, y_grouped, key)
     jax.block_until_ready(w1)
 
     train_time = time.perf_counter() - start_time

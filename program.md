@@ -234,21 +234,22 @@ No bf16 data loading tricks — the comparison must be apples-to-apples.
 | Backprop optimized (JAX) | ~1.5s   | ~389MB | ~97.5%   |
 | Backprop naive (JAX)     | ~4.5s   | ~391MB | ~97.3%   |
 | EGGROLL baseline         | ~27.3s  | ~390MB | ~97.6%   |
-| EGGROLL optimized        | ~2.9s   | ~389MB | ~97.3%   |
+| EGGROLL optimized        | ~2.3s   | ~389MB | ~97.3%   |
 | Your target              | ≤3.0s   | ≤500MB | ≥97.2%   |
 
-Current speedup: 9.4x over baseline, 1.9x gap to optimized backprop.
+Current speedup: 12.1x over baseline, 1.5x gap to optimized backprop.
 
-**Population scaling** (measured, Session 6, with adaptive smoothing + Winsorized z-score):
+**Population scaling** (measured, Session 7, with XLA triton_gemm=false):
 - HALF_POP=5000: ~5.2s, ~97.4% acc (no smoothing needed)
 - HALF_POP=2750: ~3.7s, ~97.2% acc (constant α=0.02)
 - HALF_POP=2500: ~3.5s, ~97.2% acc (adaptive α=0.10*0.7^epoch)
 - HALF_POP=2250: ~3.3s, ~97.2% acc (σ=0.032, α=0.12 adaptive)
 - HALF_POP=2000: ~3.0s, ~97.3% acc (σ=0.036, α=0.20*0.5^epoch, Winsorized ±2σ)
-- HALF_POP=1800: ~2.9s, ~97.3% acc (K=8 subgroup z-score, current)
-- HALF_POP=1600: ~2.7s est., accuracy fails all configs (~97.1%)
+- HALF_POP=1800: ~2.4s, ~97.3% acc (K=8 subgroup z-score, triton_gemm=false)
+- HALF_POP=1680: ~2.3s, ~97.3% acc (K=8, α=0.30/0.50, triton_gemm=false, current)
+- HALF_POP=1600: ~2.3s, accuracy unreliable (~97.1% avg, seed 7 fails)
 
-The kernel time scales roughly linearly with HALF_POP. JIT time (~1.6s) is constant.
+JIT time (~0.85s with triton_gemm=false) dominates — pop reduction has diminishing returns.
 
 Always run `benchmark.py` at the start of a session to get the current baseline.
 Check `nvidia-smi` — if another process is using the GPU, numbers will be inflated.
@@ -531,63 +532,117 @@ is now explicitly forbidden in the rules above.
 - The backprop baseline also uses bf16/tensor cores internally via JAX defaults, so
   this is an apples-to-apples comparison.
 
+### Session 7 (2.9s → 2.3s) — JIT reduction + population tuning
+
+20. **Disable XLA Triton GEMM autotuner** (2.9s → 2.4s): setting
+    `--xla_gpu_enable_triton_gemm=false` via `os.environ` before JAX import
+    disables XLA's internal Triton-based GEMM compilation. XLA falls back to
+    cuBLAS, which is pre-compiled and gives identical matmul results. This saves
+    ~0.6s of JIT compilation (1.45s → 0.85s). The autotuner was generating and
+    benchmarking custom Triton kernels for each GEMM shape in the scan body,
+    which was the single largest JIT cost — NOT the jax-triton bridge as
+    previously believed. NOTE: backprop also benefits (~1.5s → ~0.54s), so this
+    is a compiler efficiency optimization, not an unfair advantage.
+
+21. **Pop1680 with wave alignment** (2.4s → 2.3s): HALF_POP=1680 gives 21.0
+    full CUDA waves (1680 × 4 blocks / 320 active blocks per wave) with zero
+    tail. Pop1800 gave 22.5 waves (50% wasted on the last partial wave).
+    Retuned alpha schedule (α_start=0.30, α_decay=0.50) for accuracy at pop1680.
+
+22. **Overlap JIT compilation with data transfer** (~0.05s saved): use
+    `jax.ShapeDtypeStruct` for abstract shape lowering (no GPU memory allocation
+    for dummies) while a background thread handles CPU→GPU data transfer. The
+    JIT only needs shapes, not values, so compilation and transfer run in
+    parallel.
+
+### What did NOT work — Session 7
+- **Pure JAX forward pass (no Triton)**: 4.6x slower execution per batch AND
+  higher JIT (scan compilation is similar regardless of Triton). Dead end.
+- **Python loop instead of lax.scan**: 4.83s — Python dispatch overhead
+  (0.38ms/call × 4680 calls = 1.78s) far exceeds any JIT savings.
+- **Epoch-level Python loop + batch scan**: 2.86s — negligible improvement
+  over nested scan. The batch-level scan body dominates JIT regardless of
+  epoch-level structure.
+- **jax.pure_callback for Triton kernel**: fails — callbacks run on CPU, can't
+  invoke Triton kernels.
+- **Pop1600**: accuracy unreliable. Best config (σ=0.036, α=0.30, d=0.5, K=8)
+  gives 97.24% avg on sweep but seed 7 drops to 96.85% on individual runs.
+  Average across validation seeds: ~97.17%, fails 97.2% threshold.
+- **Shared perturbation vectors (B2=A1, B3=A2)**: reduces VEC_DIM from 1306 to
+  1050 but accuracy drops to ~94.5%. Layers need independent perturbation
+  directions.
+- **Orthogonal perturbation vectors (QR)**: cuSolver crashes on GPU. And QR
+  on 1306×1306 is too expensive anyway.
+- **Flat single scan (4680 iterations)**: same JIT as nested scan. No benefit
+  from removing epoch-level scan structure.
+- **Various XLA flags**: tested triton_softmax_fusion, priority_fusion, cublaslt,
+  command_buffer, latency_hiding_scheduler, fast_min_max — none improved
+  timing beyond triton_gemm=false.
+- **Kernel tuning at pop1680**: tested BLOCK_B={32,64,128}, BLOCK_K={16,32,64},
+  num_warps={2,4,8}, num_stages={1,2,3}. Current config (64,32,4,1) is fastest.
+- **ReLU activation**: 17% faster kernel (0.196ms vs 0.236ms) but accuracy
+  drops to 96.9% avg. Also forbidden by rules ("activation function" locked).
+
+### JIT profiling results (Session 7)
+The previous belief that jax-triton bridge adds 1.07s was WRONG. Precise
+measurement shows Triton adds only ~0.03s to JIT. The real bottleneck was
+XLA's internal Triton GEMM autotuner, which generates and benchmarks custom
+GEMM kernels during compilation.
+
+With triton_gemm=false:
+- Lowering (JAX → StableHLO): 0.24s
+- XLA Compilation (StableHLO → GPU binary): 0.45s
+- Total JIT: 0.69s (in-scan: 0.85s due to scan overhead)
+- Execution per batch: 0.29ms (0.234ms kernel + 0.06ms other)
+
 ## Ideas to try next — Reaching the stretch goal (2.0s)
 
-HALF_POP=1800 with adaptive smoothing + per-subgroup Winsorized z-score reliably
-achieves 2.9s at 97.27% avg accuracy (10/10 validation passes, 5/5 after uint8
-revert). Pop1600 fails accuracy (97.11% avg, 0/5 passes with all configs tested).
+HALF_POP=1680 with triton_gemm=false + JIT/transfer overlap achieves 2.26s at
+97.27% avg accuracy. To reach 2.0s, need another 0.26s.
 
-### Time budget at pop1800 (2.9s total, measured by first-call vs second-call):
+### Time budget at pop1680 (2.26s total, with triton_gemm=false):
 | Component | Time | % | Notes |
 |-----------|------|---|-------|
-| JIT compilation | ~1.46s | 50% | jax-triton bridge (1.07s) + XLA scan body (0.4s) |
-| Execution | ~1.28s | 44% | Triton kernel + cuBLAS matmuls + PRNG + weight updates |
-| Data prep | ~0.16s | 6% | numpy shuffle + CPU→GPU transfer (188MB fp32) |
+| JIT compilation | ~0.72s | 32% | Overlapped with 0.12s data transfer |
+| Execution | ~1.39s | 62% | Kernel (1.09s) + PRNG/gradient/update (0.30s) |
+| Data prep (CPU) | ~0.06s | 3% | numpy shuffle |
+| Data transfer | ~0.12s | 5% | CPU→GPU (overlapped with JIT) |
 
 ### What's already been tried and failed (don't re-test these)
-- ~~All items from Sessions 1-5~~ — see above
-- ~~Per-layer sigma scaling~~ — hurts accuracy catastrophically
-- ~~Structured perturbations (FWHT)~~ — too much JIT overhead (+1.5s)
-- ~~No-shuffle~~ — costs ~0.1pp accuracy at low pop
-- ~~Temperature tuning~~ — marginal effect
-- ~~Cosine LR~~ — worse than exponential decay
-- ~~uint8 data transfer~~ — works but is setup hiding, reverted
+- ~~All items from Sessions 1-6~~ — see above
+- ~~Pure JAX~~ — too slow per batch (4.6x)
+- ~~Python loop~~ — dispatch overhead kills it
+- ~~Pop1600~~ — accuracy unreliable
+- ~~Shared perturbation vectors~~ — 94.5% accuracy
+- ~~ReLU activation~~ — forbidden + 96.9% accuracy
+- ~~Various XLA flags~~ — only triton_gemm=false helps
+- ~~Kernel tuning~~ — current config is optimal
 
 ### Promising directions (haven't been tried or only partially explored)
-1. **Reducing JIT via jax-triton replacement**: JIT is 1.46s, of which 1.07s is
-   jax-triton bridge serialization. This is the single biggest time cost. Options:
-   - **Pallas with backend='triton'**: Pallas has a newer XLA-native compilation
-     pipeline. Session 3 found 0.33s JIT savings but 1.42s execution penalty at
-     pop5000. At pop1800 the execution gap may be smaller (~0.5s?). The net effect
-     might now be positive if Pallas code generation has improved since JAX 0.9.2.
-     Requires rewriting the kernel in Pallas DSL.
-   - **jax.extend.ffi / custom_call**: bypass jax-triton entirely by pre-compiling
-     the Triton kernel to a CUDA binary and calling via JAX's FFI. Could eliminate
-     most of the 1.07s bridge overhead. Complex to implement.
-   - **Pure JAX with clever tiling**: avoid Triton entirely. JIT drops to ~0.5s but
-     execution is ~3x slower (~3.5s at pop1800). NOT viable at current pop levels,
-     but could be viable if population can be reduced further.
+1. **Reducing JIT further**: JIT is 0.72s (lowering 0.24s + XLA compilation 0.45s).
+   - **Pallas kernel rewrite**: Pallas has a native XLA pipeline that avoids the
+     jax-triton lowering. Session 7 showed jax-triton bridge is only ~0.03s, so
+     Pallas won't help much with JIT. But Pallas code generation might produce
+     faster execution for some workloads.
+   - **Simplify HLO graph**: the scan body has ~970 HLO lines. Reducing PRNG
+     complexity or fusing more operations could speed up XLA compilation.
 
-2. **Further population reduction via better gradient estimation**: pop1800 is the
-   current floor. Pop1600 fails (97.11%). To go lower, need fundamentally better
+2. **Further population reduction via better gradient estimation**: pop1680 is the
+   current floor. Pop1600 fails (97.1% avg). To go lower, need fundamentally better
    gradient quality from fewer perturbations. Ideas:
-   - **Learned perturbation subspaces**: pre-compute a low-rank basis from early
-     training batches, then perturb within that subspace. Focuses perturbations on
-     directions that actually affect the loss.
-   - **Importance-weighted perturbations**: weight perturbations by their historical
-     usefulness. Requires careful design to avoid cross-batch state violations.
-   - **Natural gradient ES (xNES/OpenAI-ES hybrids)**: use the fitness-weighted
-     covariance to adapt the perturbation distribution. May violate the no-state rule
-     if the covariance is updated across batches.
+   - **Antithetic gradient with control variates**: subtract the unperturbed loss
+     baseline from each perturbed loss to reduce variance (beyond what antithetic
+     already provides). Would add one extra forward pass per batch.
+   - **Perturbation variance scaling by layer dimension**: scale perturbation
+     vectors proportionally to 1/sqrt(layer_dim) to equalize gradient SNR across
+     layers. Note: per-layer sigma scaling was tried and failed, but this is
+     different (adjusting perturbation vector magnitude, not sigma).
 
-3. **Reducing execution time at fixed pop**: the kernel achieves ~12% of FP8 peak
-   throughput at 25% occupancy. Improving occupancy would help:
-   - **Smaller accumulator via output tiling**: tile the L2 output dimension to reduce
-     the (BLOCK_B, HIDDEN) accumulator. Tested in Session 2 as "doubly-tiled J+K
-     kernel" and was slower due to GELU recomputation. But with pop1800 (fewer blocks,
-     different wave structure), the tradeoff might differ.
-   - **Warp specialization**: use different warps for different stages of the pipeline
-     (L1 compute vs L2 matmul). Requires Triton 3.0+ warp-level programming.
+3. **Reducing execution time**: kernel at 12% of FP8 peak, 25% occupancy.
+   - **Warp specialization**: use different warps for L1 compute vs L2 matmul.
+     Requires Triton 3.0+ warp-level programming.
+   - **Multi-query attention-like batching**: process multiple perturbations
+     with shared base1/w2/w3 loads using a different tiling strategy.
 
 ### What NOT to try (forbidden by fairness rules)
 - ~~Momentum / EMA of gradients~~: unfair, backprop SGD is stateless
