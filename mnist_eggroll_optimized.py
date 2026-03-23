@@ -1,5 +1,13 @@
 import os
 import sys
+
+# Disable XLA's Triton GEMM autotuner — cuBLAS fallback gives identical matmul
+# results but avoids ~0.6s of kernel autotuning during JIT compilation.
+# Must be set before importing JAX.
+os.environ.setdefault("XLA_FLAGS", "")
+if "--xla_gpu_enable_triton_gemm" not in os.environ["XLA_FLAGS"]:
+    os.environ["XLA_FLAGS"] += " --xla_gpu_enable_triton_gemm=false"
+
 import time
 import argparse
 import numpy as np
@@ -51,8 +59,8 @@ LR_START = 0.012
 LR_DECAY = 0.88
 SIGMA_START = 0.036
 SIGMA_DECAY = 0.998
-ALPHA_START = 0.20
-ALPHA_DECAY = 0.5
+ALPHA_START = 0.22
+ALPHA_DECAY = 0.45
 
 N_BATCHES = (X_train_np.shape[0] // BATCH_SIZE)  # drop last incomplete batch
 VEC_DIM = 784 + HIDDEN_DIM * 4 + 10  # B1(784)+A1(128)+B2(128)+A2(128)+B3(128)+A3(10) = 1306
