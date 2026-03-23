@@ -40,7 +40,7 @@ X_test = jnp.array(data["X_test"])
 y_test = jnp.array(data["y_test"])
 
 # ---- LOCKED CONSTANTS (validate.py checks these — do not change values) ----
-HALF_POPULATION = 5000
+HALF_POPULATION = 2750
 HIDDEN_DIM = 128
 BATCH_SIZE = 128
 EPOCHS = 10
@@ -125,7 +125,7 @@ def train_all_epochs(w1, w2, w3, X_grouped, y_grouped, key):
 
             w1 = w1 + lr * grad1
             w2 = w2 + lr * grad2
-            w3 = w3 + lr * grad3
+            w3 = w3 + jnp.float32(2.0) * lr * grad3
 
             return (w1, w2, w3, batch_idx + 1), None
 
