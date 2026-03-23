@@ -188,31 +188,31 @@ def main():
     print("Training...")
     start_time = time.perf_counter()
 
-    # Overlap JIT compilation with data transfer:
-    # 1. CPU shuffle (fast)
-    rng = np.random.default_rng(args.seed)
-    n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
-    perm = rng.permutation(X_train_np.shape[0])
-    X_shuffled = X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)
-    y_shuffled = y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE)
-
-    # 2. Start data transfer in background thread
+    # Overlap JIT compilation with CPU shuffle + data transfer:
+    # Both shuffle and JIT release the GIL, so they run truly in parallel.
     transfer_result = {}
-    def _transfer():
+    n_samples = N_GROUPS * GROUP_SIZE * BATCH_SIZE
+
+    def _shuffle_and_transfer():
+        rng = np.random.default_rng(args.seed)
+        perm = rng.permutation(X_train_np.shape[0])
+        X_shuffled = X_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE, -1)
+        y_shuffled = y_train_np[perm[:n_samples]].reshape(N_GROUPS, GROUP_SIZE * BATCH_SIZE)
         transfer_result['X'] = jnp.array(X_shuffled)
         transfer_result['y'] = jnp.array(y_shuffled)
-    transfer_thread = threading.Thread(target=_transfer)
-    transfer_thread.start()
 
-    # 3. Compile with abstract shapes (overlaps with data transfer, no GPU memory for dummies)
+    data_thread = threading.Thread(target=_shuffle_and_transfer)
+    data_thread.start()
+
+    # Compile with abstract shapes (overlaps with shuffle + transfer)
     abstract_X = jax.ShapeDtypeStruct((N_GROUPS, GROUP_SIZE * BATCH_SIZE, 784), jnp.float32)
     abstract_y = jax.ShapeDtypeStruct((N_GROUPS, GROUP_SIZE * BATCH_SIZE), jnp.int32)
     compiled = jax.jit(train_all_epochs).lower(
         w1, w2, w3, abstract_X, abstract_y, key
     ).compile()
 
-    # 4. Wait for data transfer and execute
-    transfer_thread.join()
+    # Wait for data and execute
+    data_thread.join()
     X_grouped = transfer_result['X']
     y_grouped = transfer_result['y']
 
