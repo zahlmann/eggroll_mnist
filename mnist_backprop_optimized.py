@@ -7,8 +7,6 @@ Optimized JAX backprop baseline — mirrors EGGROLL's JAX optimizations:
 
 Same architecture, hyperparameters, and training semantics as mnist_backprop.py.
 """
-import os
-import sys
 import time
 import argparse
 import numpy as np
@@ -69,7 +67,7 @@ def train_all_epochs(w1, w2, w3, X_batched, y_batched):
         def batch_step(carry, batch_data):
             w1, w2, w3 = carry
             xb, yb = batch_data
-            loss, (g1, g2, g3) = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))(w1, w2, w3, xb, yb)
+            g1, g2, g3 = jax.grad(loss_fn, argnums=(0, 1, 2))(w1, w2, w3, xb, yb)
             w1 = w1 - lr * g1
             w2 = w2 - lr * g2
             w3 = w3 - lr * g3

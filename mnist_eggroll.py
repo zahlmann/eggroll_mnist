@@ -263,20 +263,18 @@ print("Training completed. Starting evaluation.")
 def evaluate_test_set(network, X_test, y_test):
     correct = 0
     total = len(y_test)
-    predictions = []
     
     print(f"Evaluating {total} test samples...")
     
     for i in range(total):
         pred = get_prediction(network, X_test[i])
-        predictions.append(pred)
         if pred == int(y_test[i]):
             correct += 1
         
     accuracy = (correct / total) * 100
-    return accuracy, predictions
+    return accuracy
 
-test_accuracy, test_predictions = evaluate_test_set(network, X_test, y_test)
+test_accuracy = evaluate_test_set(network, X_test, y_test)
 
 print(f"\nTest Accuracy: {test_accuracy:.2f}% ({int(test_accuracy * len(y_test) / 100)}/{len(y_test)})")
 

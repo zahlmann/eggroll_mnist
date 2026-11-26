@@ -25,7 +25,7 @@ def _fused_3layer_ce_both_kernel(
     # Outputs
     partial_ce_pos_ptr, partial_ce_neg_ptr,
     # Compile-time constants
-    HALF_POP: tl.constexpr, BATCH: tl.constexpr, HIDDEN: tl.constexpr,
+    BATCH: tl.constexpr, HIDDEN: tl.constexpr,
     OUT_DIM: tl.constexpr, OUT_DIM_PAD: tl.constexpr,
     BLOCK_B: tl.constexpr, BLOCK_K: tl.constexpr, N_TILES: tl.constexpr,
 ):
@@ -122,7 +122,7 @@ def fused_3layer_ce_both(base1, xB1_T, A1, w2, B2, A2, w3, B3, A3, sigma, T_val,
             jax.ShapeDtypeStruct((HALF_POP, N_TILES), jnp.float32),
         ],
         grid=(HALF_POP, N_TILES, 2),
-        HALF_POP=HALF_POP, BATCH=BATCH, HIDDEN=HIDDEN,
+        BATCH=BATCH, HIDDEN=HIDDEN,
         OUT_DIM=OUT_DIM, OUT_DIM_PAD=OUT_DIM_PAD,
         BLOCK_B=BLOCK_B, BLOCK_K=BLOCK_K, N_TILES=N_TILES,
         num_warps=4, num_stages=1,
