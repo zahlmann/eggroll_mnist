@@ -1,50 +1,24 @@
-## EGGROLL MNIST
+# EGGROLL MNIST
 
-Evolution Strategies training of a 784→128→128→10 MLP on MNIST, using a fused Triton kernel to close the gap to backprop.
+This repo trains a 784 → 128 → 128 → 10 MLP on MNIST with evolution strategies and compares it with backpropagation. The original JAX implementation is in `mnist_eggroll.py`. It uses rank-one weight perturbations from the [EGGROLL paper](https://arxiv.org/abs/2511.16652).
 
-### Results
+The optimized trainer evaluates 1,680 pairs of opposite perturbations per batch. It shares the first-layer matrix multiplication across the population and uses a fused Triton kernel to compute the label-smoothed cross-entropy for each perturbation. Both optimized trainers use batches of 128 and train for 10 epochs.
 
-Same architecture, same GPU (RTX 4080 SUPER), fp32 data, 10 epochs:
+## Run
 
-| | Backprop (optimized) | Backprop (naive) | EGGROLL |
-|---|---|---|---|
-| **Training time** | **1.5s** | 4.5s | **2.16s** |
-| **Test accuracy** | 97.5% | 97.3% | 97.3% |
-| **Peak memory** | 389 MB | 391 MB | 389 MB |
+Use `uv` from the repository root. Optimized EGGROLL requires an NVIDIA GPU with FP8 E4M3 tensor-core support. The prepared MNIST data is included.
 
-EGGROLL does **3,360x more FLOPs** per batch (1,680 antithetic perturbation pairs × 2 forward passes each, vs 1 forward + 1 backward). The fused Triton kernel compresses this gap to **1.44x wall-clock time**.
-
-### How to run
+Run optimized EGGROLL, optimized backprop, and naive backprop in sequence with the same XLA GEMM autotuner setting. Each script prints its training time, test accuracy, and GPU memory measurement.
 
 ```bash
-uv run benchmark.py      # single seed, quick iteration
-uv run validate.py       # 3-seed validation (seeds 11, 42, 7)
+XLA_FLAGS=--xla_gpu_enable_triton_gemm=false bash run_experiments.sh
 ```
 
-### What made it fast
+To run optimized EGGROLL on its own or check its accuracy and memory across three seeds, use either command below.
 
-27s → 2.16s (12.5x) over 8 sessions of agent-driven optimization:
+```bash
+uv run mnist_eggroll_optimized.py --seed 11
+uv run validate.py
+```
 
-**Kernel + compilation (27s → 5.2s).** Fused 3-layer Triton kernel keeps all intermediates in registers (95% less HBM traffic). K-tiled L1→L2 matmul with FP8 E4M3 tensor cores. All-in-one JIT via nested `lax.scan`. Merged pos/neg kernel (3D grid).
-
-**Population reduction (5.2s → 2.9s).** Label smoothing in CE fitness gives the ES gradient information about all 10 classes, not just the correct one — enables halving population from 5000 to 1800. Per-subgroup Winsorized z-score (K=8, clip ±2.0) stabilizes gradient at low pop. Adaptive smoothing schedule (α=0.30 × 0.50^epoch) broke through the pop2500 barrier.
-
-**JIT reduction + pipeline (2.9s → 2.16s).** `--xla_gpu_enable_triton_gemm=false` saves 0.6s by skipping XLA's internal GEMM autotuner. Pop1680 for perfect CUDA wave alignment (21.0 waves, zero tail). Shuffle + GPU transfer overlapped with JIT compilation in background thread.
-
-### What didn't work
-
-**Kernel tuning:** BLOCK_B=16/32/128, BLOCK_K=64, num_stages>1, num_warps=2/8, persistent kernel, Pallas (needs sm_90+).
-
-**Algorithmic:** rank-based fitness shaping (95.6%), Boltzmann weighting (86.6%), one-sided ES (2x pop needed), per-layer sigma scaling (catastrophic), rank-2 perturbations (96.7%), float16 vectors (narrower dynamic range hurts).
-
-**Population below 1680:** pop1600 barely passes 3-seed (1 of 144 configs). Pop1520/1440/1360 all fail. Z-score tuning, sigma/LR decay sweeps — current config is already optimal.
-
-**Compilation:** pure JAX (4.6x slower), Python loops (dispatch overhead), compilation caching (unfair), various XLA flags, JAX FFI (needs C++ wrapper).
-
-### Remaining path to 2.0s
-
-The 0.16s gap is entirely JIT overhead (0.71s lowering + compilation). JAX FFI with a pre-compiled Triton kernel would save ~0.26s by bypassing jax-triton lowering, but requires a C++ shared library.
-
-### Background
-
-Implements [EGGROLL](https://arxiv.org/pdf/2511.16652) (Sarkar et al., 2025). Low-rank perturbations: `x @ (W + σ·outer(B, A)) = x@W + σ·(x@B)·A`. Temperature-scaled CE (T=2.0) with adaptive label smoothing and antithetic sampling. See `program.md` for the full optimization log.
+The validator uses seeds 11, 42, and 7. It checks the printed training constants, requires at least 97.2% mean test accuracy, and caps reported peak GPU memory at 500 MiB on each run. Training time is recorded separately.

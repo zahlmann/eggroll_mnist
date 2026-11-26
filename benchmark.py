@@ -9,11 +9,10 @@ Usage: uv run benchmark.py
 import subprocess
 import sys
 import re
-import time
 
 BASELINE = {
     "test_accuracy": 0.9764,   # baseline with seed=11 on this machine
-    "training_time_s": 66.5,   # ~66s baseline (note: README says 27s but that's without competing GPU process)
+    "training_time_s": 66.5,   # historical baseline with a competing GPU process
     "peak_memory_mb": 433.0,   # ~433MB baseline
 }
 
@@ -35,12 +34,10 @@ def parse_block(output: str, block_name: str) -> dict:
 
 def main():
     print("Running benchmark (seed=11)...")
-    t0 = time.perf_counter()
     result = subprocess.run(
         ["uv", "run", "mnist_eggroll_optimized.py", "--seed", "11"],
         capture_output=True, text=True
     )
-    wall = time.perf_counter() - t0
 
     if result.returncode != 0:
         print("CRASHED")

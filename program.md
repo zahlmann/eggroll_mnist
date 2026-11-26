@@ -34,11 +34,10 @@ See `mnist_backprop_optimized.py`.
 ## Setup (do this once at the start of each session)
 
 1. `git checkout -b autoresearch/$(date +%Y%m%d-%H%M%S)`
-2. Read this file, `kernels/__init__.py`, and `mnist_eggroll_optimized.py`
-3. Read the Triton docs in `cuda_kernels_docs/` (start with the README there)
-4. Run the baseline: `uv run benchmark.py` — note the numbers
-5. Initialize `results.tsv` if it doesn't exist (it's gitignored)
-6. Begin the experiment loop
+2. Read this file, `kernels/fused_3layer_ce.py`, and `mnist_eggroll_optimized.py`
+3. Run the baseline: `uv run benchmark.py` — note the numbers
+4. Initialize `results.tsv` if it doesn't exist (it's gitignored)
+5. Begin the experiment loop
 
 ---
 
@@ -212,8 +211,7 @@ def my_op(x):
                           grid=grid, N=N, BLOCK=512)
 ```
 
-See `cuda_kernels_docs/jax_triton/` for full examples including matmul and
-multi-output kernels. Critical: argument order to triton_call is
+Critical: argument order to triton_call is
 [input arrays] → [output arrays via out_shape] → [scalar args] → [constexpr kwargs].
 
 ---

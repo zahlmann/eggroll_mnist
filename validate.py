@@ -12,7 +12,6 @@ import sys
 import re
 import csv
 import os
-import time
 from datetime import datetime
 
 # These values are locked. If the training script prints different values the
@@ -48,14 +47,11 @@ def parse_block(output: str, block_name: str) -> dict:
 def run_seed(seed: int) -> dict | None:
     """Run the training script with the given seed. Returns parsed results or None on crash."""
     print(f"\n--- seed {seed} ---")
-    t0 = time.perf_counter()
     result = subprocess.run(
         ["uv", "run", "mnist_eggroll_optimized.py", "--seed", str(seed)],
         capture_output=True, text=True
     )
-    elapsed = time.perf_counter() - t0
 
-    combined = result.stdout + result.stderr
     if result.returncode != 0:
         print(f"  CRASHED (exit {result.returncode})")
         print(result.stdout[-800:] if result.stdout else "")
